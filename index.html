@@ -866,37 +866,136 @@ function overlap(a, b) {
 }
 
 /* =====================================================================
- * Throwing icons from the spectator's iPhone to the performer's iPhone
+ * Throwing icons from one iPhone to another
  *
- * Spectator (App Clip, link guest): pastes the screenshot of their home screen, icons are
+ * Classic mode (no ?duo):
+ *   Spectator (App Clip, link guest): pastes the screenshot of their home screen, icons are
  *   detected (same detection as Aura Fluid). Any icon can then be picked up with a finger
  *   and thrown off the screen: its spot is filled with the rebuilt wallpaper, and the icon
- *   flies over to the performer's iPhone through the AuraKit link.
- * Performer (Aura Browser, link host): the icon comes in through the opposite border
+ *   flies over to the performer's iPhone.
+ *   Performer (Aura Browser, link host): the icon comes in through the opposite border
  *   (as if the two phones were side by side), with the same direction and speed, glides
  *   and stops. The performer can move it around, or throw it back: it then flies back
  *   into its spot on the spectator's phone.
- * Roles: ?role=performer | ?role=spectator. Room code instead of App Clip pairing: ?room=CODE.
- * Desktop test: two tabs, ?mock=host and ?mock=join.
+ * Duo mode (?duo): two borrowed iPhones, both in the App Clip (same tag, same URL). Each one
+ *   pastes its own home screen, throws its own icons and receives the other's; a received
+ *   icon settles into a free spot. The messages go both over Bluetooth and through the web
+ *   server (relay.php): the first that arrives wins. The server also picks the Bluetooth
+ *   roles: the first iPhone to open the page hosts, the other joins.
+ * The icon images always go through the web server (upload.php), Bluetooth only carries short messages.
+ * Roles: ?role=performer | ?role=spectator. Room code: ?room=CODE.
+ * Desktop test: two tabs, ?mock=host and ?mock=join (duo: ?mock=join&duo in both).
  * ===================================================================== */
 
 const params = AuraKit.params;
+const duo = params.has('duo');
+const forced = (params.get('role') || '').toLowerCase();
 let role = 'guest', link = null;
+let sends = true;              // this phone has its own icons to throw (spectator, or duo)
 const sentIcons = new Set();   // icons whose image was sent over Bluetooth (fallback when the upload fails)
 // All the icons go to the web server right after detection; Bluetooth then only carries short messages.
 const UPLOAD_URL = params.get('upload') || 'upload.php';
-let upload = null;             // spectator: { session, url } once the icons are on the server
+const RELAY_URL = params.get('relay') || 'relay.php';
+const ROOM = (params.get('room') || 'duo').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40) || 'duo';
+let upload = null;             // { session, url } once this phone's icons are on the server
 
 const THROW = {
   MIN_SPEED: 650,    // finger speed at release (px/s) that counts as a throw
   OUT_SPEED: 1500,   // minimum flight speed (px/s)
   MAX_SPEED: 4500,
-  GLIDE: 0.42,       // performer: how far the icon glides in (fraction of the screen)
-  ICON_PX: 180,      // size of the image sent over the link (Bluetooth: keep it small)
+  GLIDE: 0.42,       // receiving phone: how far the icon glides in (fraction of the screen)
+  ICON_PX: 180,      // size of the icon images
 };
 const OPP = { left: 'right', right: 'left', top: 'bottom', bottom: 'top' };
 const viewW = () => window.innerWidth, viewH = () => window.innerHeight;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const rid = () => [...crypto.getRandomValues(new Uint8Array(8))].map((v) => v.toString(36).padStart(2, '0')).join('');
 if (params.has('debug')) stage.classList.add('debug');
+
+/* ---------- Messages: Bluetooth (AuraKit link) and, in duo, the web server too ---------- */
+
+const me = rid();              // this page, for the relay
+const handlers = {};
+const seenMsgs = new Set();
+let msgCount = 0;
+function onMsg(type, fn) { handlers[type] = fn; }
+// Each message carries an id: the copy that arrives second (other path) is ignored.
+function deliver(type, d) {
+  if (!d || typeof d !== 'object' || !handlers[type]) return;
+  if (d._m) {
+    if (seenMsgs.has(d._m)) return;
+    seenMsgs.add(d._m);
+    if (seenMsgs.size > 500) seenMsgs.delete(seenMsgs.values().next().value);
+  }
+  handlers[type](d);
+}
+function connected() { return !!(link && link.connected) || !!relay.peer; }
+// Resolves to true if at least one path took it.
+function send(type, data) {
+  const d = Object.assign({ _m: me + '-' + (++msgCount) }, data);
+  const tasks = [];
+  if (link && link.connected) tasks.push(link.send(type, d).catch(() => false));
+  if (relay.peer) tasks.push(relayPost({ t: type, d }));
+  return Promise.all(tasks).then((r) => r.some(Boolean));
+}
+
+/* ---------- Relay through the web server (duo) ---------- */
+
+const relay = { on: false, since: -1, peer: null, rank: -1, error: null, first: true };
+async function relayPost(body) {
+  try {
+    const res = await fetch(RELAY_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ room: ROOM, me }, body)),
+    });
+    return res.ok;
+  } catch (e) { return false; }
+}
+// Long poll: the server answers as soon as the other iPhone sent something (or after ~8 s).
+async function relayLoop() {
+  relay.on = true;
+  for (;;) {
+    try {
+      const res = await fetch(`${RELAY_URL}?room=${ROOM}&me=${me}&since=${relay.since}`, { cache: 'no-store' });
+      const j = await res.json();
+      if (!res.ok || !j.ok) throw new Error(j.error || 'HTTP ' + res.status);
+      relay.since = j.seq;
+      relay.error = null;
+      onPeers(j.peers);
+      for (const m of j.msgs) deliver(m.t, m.d);
+    } catch (e) {
+      relay.error = e.message;
+      if (relay.first) startLink('guest');   // no server: Bluetooth alone
+      showStatus();
+      await sleep(1500);
+    }
+  }
+}
+// Leaving: the other iPhone takes over as Bluetooth host right away.
+window.addEventListener('pagehide', () => {
+  if (relay.on) navigator.sendBeacon(RELAY_URL, JSON.stringify({ room: ROOM, me, leave: true }));
+});
+
+function onPeers(peers) {
+  const other = peers.find((p) => p !== me) || null;
+  relay.rank = peers.indexOf(me);
+  relay.first = false;
+  if (other !== relay.peer) {
+    relay.peer = other;
+    if (other) { sentIcons.clear(); announceIcons(); }   // a new iPhone: tell it where our icons are
+    showStatus();
+  }
+  // Bluetooth: the iPhone that opened the page first hosts, the other joins
+  startLink(relay.rank === 0 ? 'host' : 'guest');
+}
+
+let linkStarted = false;
+function startLink(want) {
+  if (!link) return;
+  if (forced) want = link.wantedRole;
+  if (!linkStarted) { linkStarted = true; link.wantedRole = want; link.start(); return; }
+  if (link.wantedRole !== want) { link.wantedRole = want; link.restart(); }
+}
 
 /* ---------- Role and link ---------- */
 
@@ -906,8 +1005,17 @@ const STATUS = {
   stopped: ['', 'Stopped'], unavailable: ['err', 'No Aura link'],
 };
 function showStatus() {
+  if (!link) return;
   const [cls, txt] = STATUS[link.status] || ['', link.status];
   const peer = [...link.peers.values()][0];
+  if (duo) {
+    const ble = link.connected ? 'connected' : link.status === 'unavailable' ? 'unavailable'
+      : link.status === 'error' ? 'error' : 'searching (' + (link.wantedRole === 'host' ? 'host' : 'guest') + ')';
+    const srv = relay.error ? 'error' : relay.peer ? 'other iPhone found' : 'waiting for the other iPhone';
+    $('status').className = connected() ? 'ok' : relay.error && !link.connected ? 'err' : 'wait';
+    $('status').textContent = 'Bluetooth: ' + ble + ' · Server: ' + srv;
+    return;
+  }
   $('status').className = cls;
   $('status').textContent = txt + (link.connected && peer ? ' · ' + peer : '') +
     (link.error && cls === 'err' ? ' — ' + link.error : '');
@@ -915,29 +1023,31 @@ function showStatus() {
 
 (async () => {
   const env = await AuraKit.ready();
-  const forced = (params.get('role') || '').toLowerCase();
   role = /^(host|magicien|magician|performer|m)$/.test(forced) ? 'host'
     : /^(guest|join|spectateur|spectator|s)$/.test(forced) ? 'guest'
-    : (env.available && !env.appClip ? 'host' : 'guest');
-  document.body.classList.add('role-' + role);
-  if (role === 'host') $('hint').textContent = 'Performer: paste your own home screen (or use a black screen). The icons thrown by the spectator land here.';
+    : duo ? 'guest' : (env.available && !env.appClip ? 'host' : 'guest');
+  sends = duo || role === 'guest';
+  document.body.classList.add(duo ? 'role-duo' : 'role-' + role);
+  if (role === 'host' && !duo) $('hint').textContent = 'Performer: paste your own home screen (or use a black screen). The icons thrown by the spectator land here.';
   link = AuraKit.link({
-    role, room: params.get('room') || undefined, urlParams: false, rememberRoom: false,
-    name: role === 'host' ? 'Performer' : 'Spectator', debug: params.has('debug'),
+    role, room: duo ? 'icons-' + ROOM : params.get('room') || undefined, urlParams: false, rememberRoom: false,
+    name: duo ? 'iPhone' : role === 'host' ? 'Performer' : 'Spectator', debug: params.has('debug'),
+    autoStart: !duo,   // duo: the server picks the role first
   });
   link.on('status', showStatus);
-  link.on('connect', () => { if (role === 'host') AuraKit.haptics.success(); showStatus(); });
+  link.on('connect', () => { AuraKit.haptics[role === 'host' && !duo ? 'success' : 'light'](); showStatus(); });
   link.on('disconnect', showStatus);
-  // (re)connected: the performer may have reloaded, tell it again where the icons are
+  // (re)connected: the other iPhone may have reloaded, tell it again where the icons are
   link.onSync(() => { sentIcons.clear(); announceIcons(); });
-  if (role === 'host') {
-    link.onMessage('icons-ready', onIconsReady);
-    link.onMessage('icon', onIcon);
-    link.onMessage('throw', onThrow);
-  }
-  else link.onMessage('return', onReturn);
+  link.onMessage('*', (type, data) => deliver(type, data));
+  if (duo) relayLoop();
   showStatus();
 })();
+
+onMsg('icons-ready', (d) => onIconsReady(d));
+onMsg('icon', (d) => onIcon(d));
+onMsg('throw', (d) => onThrow(d));
+onMsg('return', (d) => onReturn(d));
 
 /* ---------- Shared geometry ---------- */
 
@@ -991,7 +1101,7 @@ function runDetection() {
   stage.querySelectorAll('.hole, .piece').forEach((el) => el.remove());
   pieces = [];
   upload = null;
-  if (role === 'host') return;   // the performer's screenshot is just a backdrop
+  if (!sends) return;   // the performer's screenshot is just a backdrop
   session = [...crypto.getRandomValues(new Uint8Array(8))].map((v) => v.toString(36).padStart(2, '0')).join('');
   const icons = detectIcons(currentImage);
   const nw = currentImage.naturalWidth, nh = currentImage.naturalHeight;
@@ -1069,7 +1179,7 @@ async function uploadIcons(sess) {
   }
 }
 function announceIcons() {
-  if (upload && link && link.connected) link.send('icons-ready', upload);
+  if (upload && connected()) send('icons-ready', upload);
 }
 
 // Rebuilds the wallpaper inside a rectangle from the colours all around it
@@ -1156,20 +1266,20 @@ function iconData(p) {
 }
 // Fallback when the upload failed: the image goes over Bluetooth as soon as the icon is picked up.
 function preloadIcon(p) {
-  if (upload || !link || !link.connected || sentIcons.has(p.id)) return;
+  if (upload || !connected() || sentIcons.has(p.id)) return;
   sentIcons.add(p.id);
-  link.send('icon', iconData(p)).then((ok) => { if (!ok) sentIcons.delete(p.id); }, () => sentIcons.delete(p.id));
+  send('icon', iconData(p)).then((ok) => { if (!ok) sentIcons.delete(p.id); }, () => sentIcons.delete(p.id));
 }
 function sendThrow(p, t) {
-  if (!link || !link.connected) return;
+  if (!connected()) return;
   const msg = Object.assign({ id: p.id }, t);
   if (!upload && !sentIcons.has(p.id)) { Object.assign(msg, iconData(p)); sentIcons.add(p.id); }
-  link.send('throw', msg);
+  send('throw', msg);
 }
 
 let drag = null;
 viewer.addEventListener('pointerdown', (e) => {
-  if (role === 'host' || drag || !pieces.length) return;
+  if (!sends || drag || !pieces.length) return;
   const r = stage.getBoundingClientRect();
   const fx = (e.clientX - r.left) / r.width, fy = (e.clientY - r.top) / r.height;
   // the icon under the finger (a little margin around it), the closest one if several
@@ -1230,6 +1340,13 @@ function release(p, v, cancelled) {
 function onReturn(t) {
   const p = pieces.find((q) => q.id === t.id);
   if (!p || p.state !== 'away') return;
+  // duo: an icon from the other iPhone sits in this spot → it moves away to make room
+  if (p.dock) {
+    const f = p.dock;
+    undock(f);
+    f.mode = 'glide'; f.vx = 0; f.vy = 2.5 * f.h; f.k = 5; f.inX = true; f.inY = true;
+    startHostLoop();
+  }
   const c = homeCenter(p), en = entryPoint(t);
   const x0 = en.x - c.x, y0 = en.y - c.y;              // offset from its spot when it appears
   const dist = Math.hypot(x0, y0), sp = Math.max(900, t.speed * viewW());
@@ -1324,7 +1441,7 @@ function spawn(t) {
   const depth = e === 'left' || e === 'right' ? W : H;
   // glides in and slows down: total distance ≈ GLIDE × the screen
   const f = { id: t.id, el, w, h, x: en.x, y: en.y, vx: t.dx * s, vy: t.dy * s, k: s / (THROW.GLIDE * depth),
-    mode: 'glide', inX: false, inY: false, sc: 1 };
+    mode: 'glide', inX: false, inY: false, sc: 1, ds: 1, dock: null };
   flies.push(f);
   placeFly(f);
   hookFly(f);
@@ -1332,8 +1449,25 @@ function spawn(t) {
   startHostLoop();
 }
 
-function placeFly(f) { f.el.style.transform = `translate(${f.x - f.w / 2}px, ${f.y - f.h / 2}px) scale(${f.sc})`; }
-function removeFly(f) { f.el.remove(); flies = flies.filter((k) => k !== f); }
+function placeFly(f) { f.el.style.transform = `translate(${f.x - f.w / 2}px, ${f.y - f.h / 2}px) scale(${f.sc * f.ds})`; }
+function removeFly(f) { undock(f); f.el.remove(); flies = flies.filter((k) => k !== f); }
+
+// Duo: once it stops, a received icon settles into the nearest free spot
+// (left by one of this iPhone's own icons), at that icon's size.
+function dockSpot(f) {
+  const r = stage.getBoundingClientRect();
+  let best = null, bd = Infinity;
+  for (const p of pieces) {
+    if (p.state !== 'away' || p.dock) continue;
+    const x = r.left + (p.cut.x + p.cut.w / 2) * r.width, y = r.top + (p.cut.y + p.cut.h / 2) * r.height;
+    const d = Math.hypot(x - f.x, y - f.y);
+    if (d < bd) { bd = d; best = { p, x, y, s: (p.cut.w * r.width) / f.w }; }
+  }
+  return best;
+}
+function undock(f) {
+  if (f.dock) { f.dock.dock = null; f.dock = null; }
+}
 
 function hookFly(f) {
   let pid = null, gx = 0, gy = 0, tr = null;
@@ -1342,6 +1476,7 @@ function hookFly(f) {
     e.preventDefault(); e.stopPropagation();
     try { f.el.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
     pid = e.pointerId; f.mode = 'drag'; f.sc = 1.08;
+    undock(f); f.ds = 1;
     gx = e.clientX - f.x; gy = e.clientY - f.y;
     tr = tracker(); tr.add(e.clientX, e.clientY);
     $('fly').appendChild(f.el);   // on top of the others
@@ -1365,7 +1500,7 @@ function hookFly(f) {
       else { const ux = f.x - viewW() / 2, uy = f.y - viewH() / 2, m = Math.hypot(ux, uy) || 1; dx = ux / m; dy = uy / m; }
       const s = Math.min(THROW.MAX_SPEED, Math.max(THROW.OUT_SPEED, sp));
       f.mode = 'out'; f.vx = dx * s; f.vy = dy * s;
-      if (link && link.connected) link.send('return', Object.assign({ id: f.id }, exitInfo(f.x, f.y, dx, dy, s)));
+      send('return', Object.assign({ id: f.id }, exitInfo(f.x, f.y, dx, dy, s)));
     } else {
       f.mode = 'glide'; f.vx = v.vx; f.vy = v.vy; f.k = 6; f.inX = true; f.inY = true;
     }
@@ -1406,8 +1541,19 @@ function hostLoop(now) {
       const tx = Math.min(Math.max(f.x, hw), Math.max(hw, W - hw)), ty = Math.min(Math.max(f.y, hh), Math.max(hh, H - hh));
       const a = 1 - Math.exp(-14 * dt);
       f.x += (tx - f.x) * a; f.y += (ty - f.y) * a;
-      if (Math.abs(tx - f.x) < 0.5 && Math.abs(ty - f.y) < 0.5) { f.x = tx; f.y = ty; f.mode = 'rest'; }
-      else busy = true;
+      if (Math.abs(tx - f.x) < 0.5 && Math.abs(ty - f.y) < 0.5) {
+        f.x = tx; f.y = ty; f.mode = 'rest';
+        const spot = duo && dockSpot(f);
+        if (spot) { f.mode = 'dock'; f.dock = spot.p; spot.p.dock = f; f.target = spot; busy = true; }
+      } else busy = true;
+      placeFly(f);
+    } else if (f.mode === 'dock') {
+      const s = f.target, a = 1 - Math.exp(-9 * dt);
+      f.x += (s.x - f.x) * a; f.y += (s.y - f.y) * a; f.ds += (s.s - f.ds) * a;
+      if (Math.abs(s.x - f.x) < 0.3 && Math.abs(s.y - f.y) < 0.3) {
+        f.x = s.x; f.y = s.y; f.ds = s.s; f.mode = 'rest';
+        AuraKit.haptics.light();
+      } else busy = true;
       placeFly(f);
     }
   }
