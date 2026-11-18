@@ -882,7 +882,10 @@ function overlap(a, b) {
 
 const params = AuraKit.params;
 let role = 'guest', link = null;
-const sentIcons = new Set();   // icons whose image the performer already has
+const sentIcons = new Set();   // icons whose image was sent over Bluetooth (fallback when the upload fails)
+// All the icons go to the web server right after detection; Bluetooth then only carries short messages.
+const UPLOAD_URL = params.get('upload') || 'upload.php';
+let upload = null;             // spectator: { session, url } once the icons are on the server
 
 const THROW = {
   MIN_SPEED: 650,    // finger speed at release (px/s) that counts as a throw
@@ -925,8 +928,13 @@ function showStatus() {
   link.on('status', showStatus);
   link.on('connect', () => { if (role === 'host') AuraKit.haptics.success(); showStatus(); });
   link.on('disconnect', showStatus);
-  link.onSync(() => sentIcons.clear());   // (re)connected: the performer may have reloaded
-  if (role === 'host') { link.onMessage('icon', onIcon); link.onMessage('throw', onThrow); }
+  // (re)connected: the performer may have reloaded, tell it again where the icons are
+  link.onSync(() => { sentIcons.clear(); announceIcons(); });
+  if (role === 'host') {
+    link.onMessage('icons-ready', onIconsReady);
+    link.onMessage('icon', onIcon);
+    link.onMessage('throw', onThrow);
+  }
   else link.onMessage('return', onReturn);
   showStatus();
 })();
@@ -982,8 +990,9 @@ function runDetection() {
   if (!currentImage) return;
   stage.querySelectorAll('.hole, .piece').forEach((el) => el.remove());
   pieces = [];
+  upload = null;
   if (role === 'host') return;   // the performer's screenshot is just a backdrop
-  session = Date.now().toString(36);
+  session = [...crypto.getRandomValues(new Uint8Array(8))].map((v) => v.toString(36).padStart(2, '0')).join('');
   const icons = detectIcons(currentImage);
   const nw = currentImage.naturalWidth, nh = currentImage.naturalHeight;
   const full = document.createElement('canvas');
@@ -1039,6 +1048,28 @@ function runDetection() {
     stage.appendChild(cv);
     pieces.push({ id: session + '-' + i, cut, rect: b, cv, el: cv, hole: patch.cv, state: 'home', ox: 0, oy: 0, sc: 1 });
   });
+  uploadIcons(session);
+}
+
+// Every icon goes to the web server in one request; once stored, a short Bluetooth message
+// tells the performer's phone where to download them.
+async function uploadIcons(sess) {
+  try {
+    await new Promise((r) => setTimeout(r, 50));   // let the screenshot show first
+    if (sess !== session || !pieces.length) return;
+    const body = JSON.stringify({ session: sess, icons: pieces.map(iconData) });
+    const res = await fetch(UPLOAD_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    const j = await res.json();
+    if (!res.ok || !j.ok) throw new Error(j.error || 'HTTP ' + res.status);
+    if (sess !== session) return;
+    upload = { session: sess, url: new URL(j.url, new URL(UPLOAD_URL, location.href)).href };
+    announceIcons();
+  } catch (e) {
+    console.warn('[Aura Icons] upload failed, the icons will go over Bluetooth:', e.message);
+  }
+}
+function announceIcons() {
+  if (upload && link && link.connected) link.send('icons-ready', upload);
 }
 
 // Rebuilds the wallpaper inside a rectangle from the colours all around it
@@ -1123,16 +1154,16 @@ function iconData(p) {
   const r = stage.getBoundingClientRect();
   return { id: p.id, src: p.src, w: p.rect.w * r.width / viewW(), a: p.cv.width / p.cv.height };
 }
-// sent as soon as the icon is picked up, so that the throw itself is instant
+// Fallback when the upload failed: the image goes over Bluetooth as soon as the icon is picked up.
 function preloadIcon(p) {
-  if (!link || !link.connected || sentIcons.has(p.id)) return;
+  if (upload || !link || !link.connected || sentIcons.has(p.id)) return;
   sentIcons.add(p.id);
   link.send('icon', iconData(p)).then((ok) => { if (!ok) sentIcons.delete(p.id); }, () => sentIcons.delete(p.id));
 }
 function sendThrow(p, t) {
   if (!link || !link.connected) return;
   const msg = Object.assign({ id: p.id }, t);
-  if (!sentIcons.has(p.id)) { Object.assign(msg, iconData(p)); sentIcons.add(p.id); }
+  if (!upload && !sentIcons.has(p.id)) { Object.assign(msg, iconData(p)); sentIcons.add(p.id); }
   link.send('throw', msg);
 }
 
@@ -1250,6 +1281,22 @@ const recv = new Map();      // id → { src, w (fraction of the screen width), 
 const waiting = new Map();   // throws whose image hasn't arrived yet
 let flies = [];              // icons on screen
 let hraf = 0, hlast = 0;
+
+// The spectator's icons are on the server: download them all at once.
+let fetchedSession = '';
+async function onIconsReady(d) {
+  if (!d || fetchedSession === d.session) return;
+  fetchedSession = d.session;
+  try {
+    const res = await fetch(d.url, { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+    for (const ic of j.icons) onIcon(ic);
+  } catch (e) {
+    fetchedSession = '';
+    console.warn('[Aura Icons] could not download the icons:', e.message);
+  }
+}
 
 function onIcon(d) {
   recv.set(d.id, d);

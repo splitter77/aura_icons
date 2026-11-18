@@ -4,7 +4,7 @@
     {
       "name": "aura-icons",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "5176"],
+      "runtimeArgs": ["dev_server.py", "5176"],
       "port": 5176
     }
   ]
