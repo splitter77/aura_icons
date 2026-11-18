@@ -33,6 +33,17 @@ Le téléphone du magicien n'intervient pas : deux spectateurs scannent **le mê
 
 Exemple d'adresse pour le tag : `https://<serveur>/?duo&room=show1`
 
+## Verrouillage de l'App Clip (bouton de volume)
+
+Dans l'App Clip (spectateur, ou les deux téléphones en duo), un appui sur **un des boutons de volume** verrouille l'App Clip, avec une légère vibration : l'App Clip se ferme 0,5 s plus tard, sans écran noir (`LOCK_PRESS_QUIT_DELAY`). Si on la relance, elle n'affiche qu'un écran noir puis se ferme au bout d'environ 0,6 s. Le verrou est gardé dans le stockage de l'App Clip.
+
+- Le verrou s'efface tout seul au bout de 12 h (`LOCK_HOURS` en haut d'`index.html`).
+- Déverrouiller tout de suite : scanner un lien App Clip (tag NFC ou QR code) avec `&unlock` à la fin, par exemple `https://appclip.apple.com/id?p=…&userId=…&unlock`. Ce paramètre ne sert qu'une fois : pour qu'il remarche, il faut d'abord avoir scanné un lien sans `&unlock` (le tag habituel du tour). Hors App Clip : `?unlock` dans l'adresse.
+- Les variations de volume dans les 1,5 s qui suivent le lancement ne comptent pas (détection qui démarre).
+- Nécessite une version d'Aura qui gère les boutons de volume (Aura 1.9+, branche `feature/aurakit-quit` de fsbrowser). La ligne d'état sous le bouton Paste indique `Volume: ready`, `locked`, ou `not supported by this Aura version`. Dans l'App Clip, iOS peut afficher l'indicateur de volume pendant l'appui.
+- Fermer l'App Clip nécessite que le Bluetooth soit activé et autorisé ; sinon l'écran reste noir.
+- Sur ordinateur (`?mock=join`) : touche **+** ou **-**.
+
 ## Transfert des icônes
 
 Le Bluetooth est lent pour des images : elles passent donc par le serveur web.

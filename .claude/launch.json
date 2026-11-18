@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "aura-icons",
-      "runtimeExecutable": "python",
+      "runtimeExecutable": "python3",
       "runtimeArgs": ["dev_server.py", "5176"],
       "port": 5176
     }

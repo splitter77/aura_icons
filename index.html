@@ -6,7 +6,23 @@
 <title>Aura Icons</title>
 <script src="aurakit/aurakit-mock.js"></script> <!-- desktop simulator, only active with ?mock=host / ?mock=join -->
 <script src="aurakit/aurakit.js"></script>
+<script>
+// App Clip lock (armed with a volume button): on the next launch the page is just a black screen,
+// then the App Clip quits. It wears off after LOCK_HOURS; ?unlock (or &unlock on the scanned
+// App Clip link) clears it.
+const LOCK_KEY = 'aura-icons.locked';
+const LOCK_HOURS = 12;
+(() => {
+  try {
+    const at = Number(localStorage.getItem(LOCK_KEY));
+    if (new URLSearchParams(location.search).has('unlock') || (at && Date.now() - at > LOCK_HOURS * 3600e3)) localStorage.removeItem(LOCK_KEY);
+    if (localStorage.getItem(LOCK_KEY)) document.documentElement.classList.add('locked');
+  } catch (e) { /* no storage: no lock */ }
+})();
+</script>
 <style>
+  html.locked, html.locked body { background: #000 !important; }
+  html.locked body > * { display: none !important; }
   * { box-sizing: border-box; }
   html, body {
     margin: 0; height: 100%;
@@ -1022,6 +1038,91 @@ function startLink(want) {
   if (link.wantedRole !== want) { link.wantedRole = want; link.restart(); }
 }
 
+/* ---------- App Clip lock ---------- */
+// In the App Clip, a press on either volume button locks it, and 0.5 s later the App Clip
+// quits (the screen stays as it is). Any later launch also shows a black screen and quits the App Clip (the lock is kept in this App Clip's storage,
+// LOCK_KEY / LOCK_HOURS are set at the top of the page). To unlock: ?unlock in the address, or
+// &unlock on the scanned App Clip link (the App Clip page only gets it through Aura.launchParams()).
+const LOCK_QUIT_DELAY = 600;   // ms of black screen before the App Clip quits (relaunch while locked)
+const LOCK_PRESS_QUIT_DELAY = 500;   // ms between the volume press (lock) and the quit
+const LOCK_IGNORE_MS = 1500;   // volume changes right after watching starts are not presses
+let lockInfo = '';   // shown in the status line: whether the volume buttons are watched
+let lockWatch = null, lockSince = 0, lockEvents = 0;
+function onVolume() {
+  lockEvents++;
+  if (params.has('debug')) showStatus();
+  if (performance.now() - lockSince < LOCK_IGNORE_MS) return;
+  try {
+    if (localStorage.getItem(LOCK_KEY)) return;
+    localStorage.setItem(LOCK_KEY, String(Date.now()));
+    AuraKit.haptics.soft();   // discreet confirmation for the performer
+    lockInfo = 'Volume: locked'; showStatus();
+  } catch (e) { lockInfo = 'Volume: cannot lock (' + e.message + ')'; showStatus(); return; }
+  // Locked: the App Clip quits as it is, no black screen (the Bluetooth link is already up here).
+  if (lockWatch) { lockWatch.stop(); lockWatch = null; }
+  quitLocked(AuraKit.env || {}, LOCK_PRESS_QUIT_DELAY, false);
+}
+// (Re)starts watching the volume buttons. Started at load, then again on the first touch: like the
+// AuraKit demo, which starts on a tap — at load the App Clip's audio session may not be ready yet.
+async function watchVolume() {
+  try {
+    if (lockWatch) { lockWatch.stop(); lockWatch = null; await sleep(80); }   // let the native stop go through first
+    lockWatch = await AuraKit.volumeButtons.watch(onVolume);
+    if (!/locked/.test(lockInfo)) lockInfo = 'Volume: ready';
+  } catch (e) {
+    lockInfo = 'Volume: ' + (/newer version/.test(e.message) ? 'not supported by this Aura version' : e.message);
+    console.warn('[Aura Icons] volume buttons unavailable:', e.message);
+  }
+  showStatus();
+}
+function armLock() {
+  lockInfo = 'Volume: …';
+  lockSince = performance.now();   // volume changes just after launch are not presses
+  watchVolume();
+  const onTouch = () => { window.removeEventListener('pointerdown', onTouch, true); watchVolume(); };
+  window.addEventListener('pointerdown', onTouch, true);
+}
+// The scanned link's parameters stay readable when the App Clip is relaunched without a new scan,
+// so &unlock is used only once: it works again after a scan of a link without it (the trick's usual tag).
+const UNLOCK_SEEN_KEY = 'aura-icons.unlock-seen';
+async function unlockedByLink() {
+  try {
+    const A = window.Aura;
+    const p = A && typeof A.launchParams === 'function' ? await A.launchParams() : {};
+    if (!p || !('unlock' in p)) { localStorage.removeItem(UNLOCK_SEEN_KEY); return false; }
+    if (localStorage.getItem(UNLOCK_SEEN_KEY)) return false;
+    localStorage.setItem(UNLOCK_SEEN_KEY, '1');
+    localStorage.removeItem(LOCK_KEY);
+    document.documentElement.classList.remove('locked');
+    return true;
+  } catch (e) { return false; }
+}
+// Quitting relies on AuraKit's Bluetooth crash trick: right after launch Bluetooth may not be ready
+// yet, so it tries again a few times. The last error is kept and shown on the next normal launch.
+const QUIT_ERROR_KEY = 'aura-icons.quit-error';
+let quitInfo = '';   // why the last quit failed (status line)
+async function quitLocked(env, delay = LOCK_QUIT_DELAY, hideBar = true) {
+  if (hideBar) AuraKit.statusBar.hide().catch(() => {});
+  if (!env.appClip) return;   // outside the App Clip: stays black
+  await sleep(delay);
+  for (let i = 1; i <= 5; i++) {
+    try { await AuraKit.quitAppClip(); return; } catch (e) {
+      console.warn('[Aura Icons] quit attempt ' + i + ':', e.message);
+      try { localStorage.setItem(QUIT_ERROR_KEY, `${new Date().toLocaleTimeString()} · try ${i}: ${e.message}`); } catch (err) { /* ignore */ }
+    }
+    await sleep(1500);
+  }
+  // still running: stays black
+}
+// Unlocked launch: show why the last quit failed, once.
+function quitErrorInfo() {
+  try {
+    const m = localStorage.getItem(QUIT_ERROR_KEY);
+    if (m) localStorage.removeItem(QUIT_ERROR_KEY);
+    return m ? 'Quit failed (' + m + ')' : '';
+  } catch (e) { return ''; }
+}
+
 /* ---------- Role and link ---------- */
 
 const STATUS = {
@@ -1029,7 +1130,8 @@ const STATUS = {
   searching: ['wait', 'Looking for the performer…'], connected: ['ok', 'Connected'], error: ['err', 'Error'],
   stopped: ['', 'Stopped'], unavailable: ['err', 'No Aura link'],
 };
-const syncInfo = () => (params.has('debug') && clock.offset !== null ? ` · latence ${Math.round(clock.rtt / 2)} ms` : '');
+const syncInfo = () => (params.has('debug') && clock.offset !== null ? ` · latence ${Math.round(clock.rtt / 2)} ms` : '') +
+  (lockInfo ? ' · ' + lockInfo + (params.has('debug') ? ` (${lockEvents})` : '') : '') + (quitInfo ? ' · ' + quitInfo : '');
 function showStatus() {
   if (!link) return;
   const [cls, txt] = STATUS[link.status] || ['', link.status];
@@ -1049,10 +1151,14 @@ function showStatus() {
 
 (async () => {
   const env = await AuraKit.ready();
+  await unlockedByLink();   // also run unlocked: it resets the once-only marker
+  if (document.documentElement.classList.contains('locked')) { quitLocked(env); return; }
   role = /^(host|magicien|magician|performer|m)$/.test(forced) ? 'host'
     : /^(guest|join|spectateur|spectator|s)$/.test(forced) ? 'guest'
     : duo ? 'guest' : (env.available && !env.appClip ? 'host' : 'guest');
   sends = duo || role === 'guest';
+  if (sends) armLock();   // the phones that throw their icons: spectator (App Clip), or both in duo
+  quitInfo = quitErrorInfo();
   document.body.classList.add(duo ? 'role-duo' : 'role-' + role);
   if (role === 'host' && !duo) $('hint').textContent = 'Performer: paste your own home screen (or use a black screen). The icons thrown by the spectator land here.';
   link = AuraKit.link({
@@ -1365,7 +1471,8 @@ function release(p, v, cancelled) {
 // The performer threw it back: it comes in through the opposite border and lands in its spot.
 function onReturn(t) {
   const p = pieces.find((q) => q.id === t.id);
-  if (!p || p.state !== 'away') return;
+  // 'flying': the message came back before this phone saw the icon leave the screen (paused animation)
+  if (!p || (p.state !== 'away' && p.state !== 'flying')) return;
   // duo: an icon from the other iPhone sits in this spot → it moves away to make room
   if (p.dock) {
     const f = p.dock;
@@ -1379,7 +1486,9 @@ function onReturn(t) {
   const lead = Math.min(0.5 * dist, 0.12 * sp);         // keeps its heading for a moment, then curves home
   p.path = { x0, y0, x1: x0 + t.dx * lead, y1: y0 + t.dy * lead };
   p.dur = Math.min(900, Math.max(380, 1600 * dist / sp));
-  p.start = Math.max(performance.now() - 400, localTime(t));   // late message: the flight starts already under way
+  // late message: the flight starts already under way; never more than 1.5 s ahead (bad clock sync)
+  p.start = Math.min(performance.now() + 1500, Math.max(performance.now() - 400, localTime(t)));
+  p.el.classList.remove('on', 'lift');
   p.state = 'returning';
   startLoop();
 }
@@ -1494,7 +1603,7 @@ function spawn(t, late = 0) {
 }
 
 function placeFly(f) { f.el.style.transform = `translate(${f.x - f.w / 2}px, ${f.y - f.h / 2}px) scale(${f.sc * f.ds})`; }
-function removeFly(f) { undock(f); f.el.remove(); flies = flies.filter((k) => k !== f); }
+function removeFly(f) { undock(f); if (f.off) f.off(); f.el.remove(); flies = flies.filter((k) => k !== f); }
 
 // Duo: once it stops, a received icon settles into the nearest free spot
 // (left by one of this iPhone's own icons), at that icon's size.
@@ -1515,8 +1624,10 @@ function undock(f) {
 
 function hookFly(f) {
   let pid = null, gx = 0, gy = 0, tr = null;
+  // A new finger always takes over: if the previous touch's end got lost (capture lost,
+  // gesture interrupted by iOS), the icon would otherwise stay held forever.
   f.el.addEventListener('pointerdown', (e) => {
-    if (f.mode === 'out' || pid !== null) return;
+    if (f.mode === 'out' || e.pointerId === pid) return;
     e.preventDefault(); e.stopPropagation();
     try { f.el.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
     pid = e.pointerId; f.mode = 'drag'; f.sc = 1.08;
@@ -1526,12 +1637,12 @@ function hookFly(f) {
     $('fly').appendChild(f.el);   // on top of the others
     placeFly(f);
   });
-  f.el.addEventListener('pointermove', (e) => {
+  const move = (e) => {
     if (e.pointerId !== pid) return;
     f.x = e.clientX - gx; f.y = e.clientY - gy;
     tr.add(e.clientX, e.clientY);
     placeFly(f);
-  });
+  };
   const up = (e) => {
     if (e.pointerId !== pid) return;
     pid = null; f.sc = 1;
@@ -1551,8 +1662,11 @@ function hookFly(f) {
     placeFly(f);
     startHostLoop();
   };
-  f.el.addEventListener('pointerup', up);
-  f.el.addEventListener('pointercancel', up);
+  // listened on the whole window: the finger's moves and lift still count if the capture got lost
+  f.off = () => ['pointermove', 'pointerup', 'pointercancel'].forEach((t, i) => window.removeEventListener(t, i ? up : move));
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
 }
 
 function startHostLoop() { if (!hraf) { hlast = performance.now(); hraf = requestAnimationFrame(hostLoop); } }
