@@ -1,0 +1,1372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Aura Icons</title>
+<script src="aurakit/aurakit-mock.js"></script> <!-- desktop simulator, only active with ?mock=host / ?mock=join -->
+<script src="aurakit/aurakit.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: #0e0f13; color: #eee;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  body { display: flex; align-items: center; justify-content: center; overflow: hidden; touch-action: none; }
+
+  /* Home screen */
+  #home { display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; padding: 24px; }
+  #pasteBtn, #blackBtn {
+    font-size: 22px; font-weight: 600; padding: 18px 48px;
+    border: none; border-radius: 16px; cursor: pointer;
+    background: linear-gradient(135deg, #6c5ce7, #a66cff); color: white;
+    box-shadow: 0 10px 30px rgba(108, 92, 231, .4);
+    transition: transform .15s;
+  }
+  #blackBtn { font-size: 16px; padding: 12px 28px; background: #26272e; box-shadow: none; }
+  #pasteBtn:active, #blackBtn:active { transform: scale(.96); }
+  #hint { opacity: .6; font-size: 14px; max-width: 360px; }
+  #error { color: #ff7b7b; font-size: 14px; min-height: 1em; }
+  #status { font-size: 13px; opacity: .55; min-height: 1em; }
+  #status::before { content: '● '; color: #777; }
+  #status.ok::before { color: #3ddc84; }
+  #status.wait::before { color: #f5b942; }
+  #status.err::before { color: #ff7b7b; }
+  .host-only { display: none; }
+  body.role-host .host-only { display: block; }
+
+  /* Image view */
+  #viewer { display: none; position: fixed; inset: 0; align-items: center; justify-content: center; }
+  body.black, body.black #viewer { background: #000; }
+  #stage { position: relative; line-height: 0; }
+  #stage img { max-width: 100vw; max-height: 100vh; display: block; -webkit-user-drag: none; pointer-events: none; }
+  body.black #stage img { display: none; }
+  /* wallpaper rebuilt where an icon (and its label) used to be */
+  .hole { position: absolute; display: none; pointer-events: none; }
+  .hole.on { display: block; }
+  /* cut-out icon (+ its badge), shown only once it leaves its spot */
+  .piece { position: absolute; display: none; pointer-events: none; z-index: 2; will-change: transform; transform-origin: 50% 50%; }
+  .piece.on { display: block; }
+  .piece.lift { filter: drop-shadow(0 10px 14px rgba(0,0,0,.35)); }
+  #stage.debug .piece { display: block; outline: 2px solid rgba(0,255,140,.85); opacity: .5; }
+
+  /* Performer: icons received from the spectator's phone */
+  #fly { position: fixed; inset: 0; pointer-events: none; z-index: 5; }
+  #fly img {
+    position: absolute; left: 0; top: 0; pointer-events: auto; touch-action: none;
+    will-change: transform; -webkit-user-drag: none; filter: drop-shadow(0 6px 10px rgba(0,0,0,.3));
+  }
+</style>
+</head>
+<body>
+
+<div id="home">
+  <button id="pasteBtn">📋 Paste</button>
+  <div id="hint">Copy a screenshot, then click “Paste” (or press Ctrl/⌘ + V).</div>
+  <button id="blackBtn" class="host-only">Black screen</button>
+  <div id="error"></div>
+  <div id="status"></div>
+</div>
+
+<div id="viewer">
+  <div id="stage"><img id="img" alt="" /></div>
+</div>
+<div id="fly"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const home = $('home'), viewer = $('viewer'), stage = $('stage'), img = $('img');
+
+let currentImage = null; // loaded HTMLImageElement
+
+/* ---------- Reading the clipboard ---------- */
+
+$('pasteBtn').addEventListener('click', async () => {
+  $('error').textContent = '';
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.read) throw new Error('unsupported');
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      const type = item.types.find((t) => t.startsWith('image/'));
+      if (type) return loadFromBlob(await item.getType(type));
+    }
+    $('error').textContent = "No image in the clipboard.";
+  } catch (e) {
+    $('error').textContent = e.message === 'unsupported'
+      ? "Your browser doesn't support reading the clipboard directly: use Ctrl/⌘ + V."
+      : "Clipboard access denied. Try Ctrl/⌘ + V.";
+  }
+});
+
+// Fallback: Ctrl/⌘ + V at any time
+window.addEventListener('paste', (e) => {
+  const file = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'))?.getAsFile();
+  if (file) { e.preventDefault(); loadFromBlob(file); }
+});
+
+function loadFromBlob(blob) {
+  const url = URL.createObjectURL(blob);
+  const im = new Image();
+  im.onload = () => {
+    currentImage = im;
+    img.src = url;
+    document.body.classList.remove('black');
+    home.style.display = 'none';
+    viewer.style.display = 'flex';
+    runDetection();
+  };
+  im.onerror = () => { $('error').textContent = "Unable to read the image."; };
+  im.src = url;
+}
+window.loadFromBlob = loadFromBlob;
+
+// Performer only: plain black screen instead of a screenshot
+function showBlack() {
+  document.body.classList.add('black');
+  home.style.display = 'none';
+  viewer.style.display = 'flex';
+}
+$('blackBtn').addEventListener('click', showBlack);
+
+/* ---------- Icon detection ---------- */
+
+// Approach: a coarse pass on a downscaled image finds the icons (home-screen grid,
+// otherwise generic analysis), then each edge is measured at full resolution and, in grid mode,
+// all icons are snapped to a common size and to shared rows / columns.
+function detectIcons(image) {
+  const nw = image.naturalWidth, nh = image.naturalHeight;
+  const grab = (w, h) => {
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, w, h);
+    return ctx.getImageData(0, 0, w, h).data;
+  };
+
+  // 1. Downscale for the coarse analysis
+  const MAX = 1000;
+  const scale = Math.min(1, MAX / Math.max(nw, nh));
+  const W = Math.max(1, Math.round(nw * scale));
+  const H = Math.max(1, Math.round(nh * scale));
+  const px = grab(W, H);
+
+  // 2. Edge strength (color gradient)
+  const grad = new Uint16Array(W * H);
+  for (let y = 0; y < H - 1; y++) {
+    for (let x = 0; x < W - 1; x++) {
+      const p = y * W + x, i = p * 4, r = i + 4, d = i + W * 4;
+      let g = 0;
+      for (let c = 0; c < 3; c++) {
+        g = Math.max(g, Math.abs(px[i + c] - px[r + c]) + Math.abs(px[i + c] - px[d + c]));
+      }
+      grad[p] = g;
+    }
+  }
+
+  // 3. Home screen? Look for a regular grid of same-size icons
+  //    (much more reliable on a photo wallpaper). Otherwise: generic analysis.
+  const squares = findSquares(px, grad, W, H);
+  const grid = detectGrid(px, grad, W, H, squares);
+  // off-grid: connected components + confident squares (which recover icons stuck to their label)
+  const coarse = grid || detectLoose(px, grad, W, H).concat(squares.filter((q) => q.score >= 0.8));
+
+  // 4. Fine measurement at full resolution (capped for very large images)
+  const fs = Math.min(1, 3000 / Math.max(nw, nh));
+  const FW = Math.max(1, Math.round(nw * fs)), FH = Math.max(1, Math.round(nh * fs));
+  const fpx = scale === fs ? px : grab(FW, FH);
+  const kx = FW / W, ky = FH / H;
+  let approx = coarse.map((b) => ({ x: b.x * kx, y: b.y * ky, w: b.w * kx, h: b.h * ky, weak: b.weak, group: b.group }));
+  // (off-grid, the coarse box is less reliable: search for the edge further out)
+  let meas = approx.map((b) => measureEdges(fpx, FW, FH, b, grid ? 0.1 : 0.2, !!grid));
+  if (grid) {
+    // each cell must show real straight edges, in the right place, at full resolution:
+    // at least 2 for a confident cell, 3 for a doubtful one (otherwise: empty cell, widget, wallpaper pattern…)
+    const keep = approx.map((b, i) => confirmCell(b, meas[i], b.weak ? 3 : 2));
+    approx = approx.filter((b, i) => keep[i]);
+    meas = meas.filter((m, i) => keep[i]);
+  }
+  const tight = grid ? alignGrid(approx, meas) : looseBoxes(approx, meas, fpx, FW, FH);
+
+  // 5. Outputs in relative coordinates (0..1):
+  //    cut = flush with the icon (it doesn't take wallpaper with it when falling),
+  //    box = blurred area, with a small margin (folder rim, anti-aliasing).
+  const rel = (b) => ({ x: b.x / FW, y: b.y / FH, w: b.w / FW, h: b.h / FH });
+  const grow = (b, m) => ({ x: b.x - m, y: b.y - m, w: b.w + 2 * m, h: b.h + 2 * m });
+  const out = tight.map((b) => ({ ...rel(grow(b, 0.025 * b.w + 2)), cut: rel(b) }));
+
+  // 6. Notification badges (red, top right of the icon)
+  tight.forEach((b, i) => {
+    const badge = findBadge(fpx, FW, FH, b);
+    if (badge) out.push({ ...rel(grow(badge, 0.04 * badge.h + 1)), cut: rel(badge), badge: true, of: i });
+  });
+  out.grid = !!grid; // home-screen grid: each icon has a label under it
+  return out;
+}
+
+// Generic analysis (screenshots other than the home screen): connected components of edges,
+// multi-threshold (low-contrast icons) and multi-scale:
+//   small dilation = keeps the icon separate from its label,
+//   large dilation = joins the pieces of a line-art icon.
+function detectLoose(px, grad, W, H) {
+  const N = W * H, minDim = Math.min(W, H);
+  const color = new Uint8Array(N);
+  for (let p = 0, i = 0; p < N; p++, i += 4) {
+    color[p] = Math.max(px[i], px[i + 1], px[i + 2]) - Math.min(px[i], px[i + 1], px[i + 2]) > 50 ? 1 : 0;
+  }
+  const colorSum = integral(color, W, H);
+  const sumIn = (S, b) => {
+    const x0 = Math.max(0, Math.floor(b.x)), y0 = Math.max(0, Math.floor(b.y));
+    const x1 = Math.min(W, Math.ceil(b.x + b.w)), y1 = Math.min(H, Math.ceil(b.y + b.h));
+    if (x1 <= x0 || y1 <= y0) return 0;
+    const w1 = W + 1;
+    return S[y1 * w1 + x1] - S[y0 * w1 + x1] - S[y1 * w1 + x0] + S[y0 * w1 + x0];
+  };
+
+  const minSide = Math.max(8, minDim * 0.045); // smaller: text, not an icon
+  const maxSide = minDim * 0.45;
+  const isIconShape = (b) =>
+    b.w >= minSide && b.h >= minSide && b.w <= maxSide && b.h <= maxSide &&
+    b.w / b.h >= 0.8 && b.w / b.h <= 1.25 &&
+    b.x > 1 && b.y > 1 && b.x + b.w < W - 1 && b.y + b.h < H - 1; // cut by the image border: ignore
+
+  const unit = Math.max(1, minDim / 500);
+  const radii = [...new Set([1, 2, 3, 5, 8].map((r) => Math.max(1, Math.round(r * unit))))];
+  const candidates = [];
+  for (const T of [22, 40]) {
+    const edge = new Uint8Array(N);
+    for (let p = 0; p < N; p++) edge[p] = grad[p] > T ? 1 : 0;
+    const edgeSum = integral(edge, W, H);
+    for (const R of radii) {
+      const boxes = components(dilate(edge, W, H, R), W, H)
+        .map((b) => ({ x: b.x + R, y: b.y + R, w: b.w - 2 * R, h: b.h - 2 * R }))
+        .filter((b) => b.w > 2 && b.h > 2);
+
+      for (const b of boxes) {
+        if (!isIconShape(b)) continue;
+        const area = b.w * b.h;
+        const edges = sumIn(edgeSum, b);
+        if (edges < (b.w + b.h) * 0.9) continue;          // too empty
+        if (edges > area * 0.55) continue;                 // texture / noise
+        const colorful = sumIn(colorSum, b) / area;
+        // Text rejection: a letter has neighbors of the same height, aligned and very close.
+        if (colorful < 0.15 && looksLikeText(b, boxes)) continue;
+        candidates.push(b);
+      }
+    }
+  }
+
+  // Merge candidates from the different scales
+  const squareness = (b) => Math.min(b.w, b.h) / Math.max(b.w, b.h); // 1 = perfect square
+  candidates.sort((a, b) => a.w * a.h - b.w * b.h);
+  const kept = [];
+  for (const c of candidates) {
+    const dupe = kept.findIndex((k) => iou(c, k) > 0.6);
+    if (dupe === -1) kept.push(c);
+    else if (squareness(c) > squareness(kept[dupe]) + 0.03) kept[dupe] = c; // keep the squarest
+  }
+  // Large boxes first:
+  //  - contains several icons → merged group… or folder: set aside, fine measurement will decide;
+  //  - contains a single box almost as large but squarer (icon + label) → drop the enclosing one;
+  //  - otherwise it's an icon, and what it contains (its inner artwork) is ignored.
+  kept.sort((a, b) => b.w * b.h - a.w * a.h);
+  const final = [], groups = [];
+  for (const c of kept) {
+    if (final.some((f) => overlap(c, f) > 0.5 * c.w * c.h)) continue;
+    if (groups.some((g) => iou(c, g) > 0.6)) continue;
+    const area = c.w * c.h;
+    const children = kept.filter((k) => k !== c && overlap(k, c) > 0.8 * k.w * k.h && k.w * k.h > 0.12 * area);
+    const big = children.filter((k) => k.w * k.h > 0.55 * area);
+    if (big.some((k) => squareness(k) > squareness(c) + 0.03)) continue;
+    if (!big.length && children.length >= 2) { groups.push({ ...c, group: true }); continue; }
+    final.push(c);
+  }
+  return final.concat(groups);
+}
+
+/* ---------- Fine edge measurement (full resolution) ---------- */
+
+// For each side, scan lines perpendicular to the edge, taken from the straight part
+// of the side (iOS icon corners are "squircles" that curve over ~1/3 of the side).
+// The real edge is a straight line: the color jump sits at the same spot on
+// almost every line, unlike the inner artwork or the wallpaper.
+// reach: half-width of the search zone around the estimated edge (as a fraction of the size);
+// outer: take the outermost strong peak (otherwise the strongest, if the zone is wide).
+// Returns for each side { p: edge position (continuous coordinate), ok: reliable measurement }.
+function measureEdges(px, W, H, b, reach = 0.1, outer = true) {
+  const s = (b.w + b.h) / 2, win = Math.max(3, Math.round(reach * s)), n = 24;
+  const at = (x, y) => {
+    x = x < 0 ? 0 : x >= W ? W - 1 : x; y = y < 0 ? 0 : y >= H ? H - 1 : y;
+    return (y * W + x) * 4;
+  };
+  const res = {};
+  for (const side of ['L', 'R', 'T', 'B']) {
+    const horiz = side === 'L' || side === 'R';
+    const e0 = side === 'L' ? b.x : side === 'R' ? b.x + b.w : side === 'T' ? b.y : b.y + b.h;
+    const lo = Math.round(e0 - win), len = 2 * win + 1;
+    const g = new Float32Array(n * len);
+    for (let k = 0; k < n; k++) {
+      const u = Math.round(horiz ? b.y + b.h * (0.38 + 0.24 * k / (n - 1)) : b.x + b.w * (0.38 + 0.24 * k / (n - 1)));
+      for (let j = 0; j < len; j++) {
+        const t = lo + j; // edge between pixels t-1 and t
+        const i = horiz ? at(t - 1, u) : at(u, t - 1), q = horiz ? at(t, u) : at(u, t);
+        g[k * len + j] = Math.abs(px[i] - px[q]) + Math.abs(px[i + 1] - px[q + 1]) + Math.abs(px[i + 2] - px[q + 2]);
+      }
+    }
+    // consistency: value exceeded by ~70% of lines (inner artwork doesn't cover every line)
+    const A = new Float32Array(len), col = new Float32Array(n);
+    for (let j = 0; j < len; j++) {
+      for (let k = 0; k < n; k++) col[k] = g[k * len + j];
+      col.sort();
+      A[j] = col[Math.floor(n * 0.3)];
+    }
+    let max = 0;
+    for (let j = 0; j < len; j++) max = Math.max(max, A[j]);
+    // outermost peak among the strong peaks (the icon outline, not its artwork)
+    const outward = side === 'L' || side === 'T';
+    let pk = -1;
+    for (let jj = 0; jj < len; jj++) {
+      const j = outward ? jj : len - 1 - jj;
+      const prev = j > 0 ? A[j - 1] : -1, next = j < len - 1 ? A[j + 1] : -1;
+      if (A[j] >= (outer ? 0.5 : 1) * max && A[j] >= prev && A[j] >= next) { pk = j; break; }
+    }
+    // sub-pixel precision (parabola fit on the peak)
+    let off = 0;
+    if (pk > 0 && pk < len - 1) {
+      const a = A[pk - 1], c = A[pk + 1], d = a - 2 * A[pk] + c;
+      if (d < 0) off = Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / d));
+    }
+    const sorted = [...A].sort((x, y) => x - y), med = sorted[len >> 1];
+    // reliable if the jump is sharp, consistent, and stands out clearly from the rest of the window
+    const ok = pk >= 0 && max >= 18 && max >= 2.2 * med + 6;
+    res[side] = { p: lo + pk + off, ok, v: max };
+  }
+  return res;
+}
+
+function confirmCell(b, m, need) {
+  // sharp edges found near their expected place (the coarse size may be slightly off)
+  const ref = { L: b.x, R: b.x + b.w, T: b.y, B: b.y + b.h };
+  return ['L', 'R', 'T', 'B'].filter((k) => m[k].ok && Math.abs(m[k].p - ref[k]) <= 0.1 * b.w).length >= need;
+}
+
+const median = (arr) => {
+  if (!arr.length) return NaN;
+  const s = [...arr].sort((a, b) => a - b), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+
+// Measured center and size of an icon on one axis; falls back to the coarse box if an edge is missing.
+// (two edges not at the right distance from each other: inconsistent measurement, ignored)
+function axisFit(m, a, b, c0, S) {
+  if (m[a].ok && m[b].ok) {
+    if (Math.abs(m[b].p - m[a].p - S) <= 0.04 * S) return { c: (m[a].p + m[b].p) / 2, ok: 2 };
+    return { c: c0, ok: 0 };
+  }
+  if (m[a].ok) return { c: m[a].p + S / 2, ok: 1 };
+  if (m[b].ok) return { c: m[b].p - S / 2, ok: 1 };
+  return { c: c0, ok: 0 };
+}
+
+// Grid mode: common size, shared rows, shared columns per block
+// (the dock forms its own block: its columns don't necessarily line up with the grid's).
+function alignGrid(approx, meas) {
+  const sizes = [];
+  meas.forEach((m) => {
+    if (m.L.ok && m.R.ok) sizes.push(m.R.p - m.L.p);
+    if (m.T.ok && m.B.ok) sizes.push(m.B.p - m.T.p);
+  });
+  const S0 = median(approx.map((b) => (b.w + b.h) / 2));
+  // outlier sizes (inner edge taken for the outline) discarded before the median
+  let S = median(sizes.filter((v) => Math.abs(v - S0) < 0.15 * S0));
+  if (!(S > 0)) S = S0;
+  const fit = approx.map((b, i) => ({
+    x: axisFit(meas[i], 'L', 'R', b.x + b.w / 2, S),
+    y: axisFit(meas[i], 'T', 'B', b.y + b.h / 2, S),
+  }));
+  // rows: center = median of measured centers (most reliable first)
+  const level = (list, key) => Math.max(...list.map((i) => fit[i][key].ok));
+  const best = (list, key) => {
+    const lvl = level(list, key);
+    return median(list.filter((i) => fit[i][key].ok === lvl).map((i) => fit[i][key].c));
+  };
+  const groups = (idx, key, ref) => {
+    const sorted = [...idx].sort((a, b) => ref(a) - ref(b)), out = [];
+    for (const i of sorted) {
+      const g = out[out.length - 1];
+      if (g && ref(i) - ref(g[g.length - 1]) < 0.5 * S) g.push(i); else out.push([i]);
+    }
+    return out;
+  };
+  const all = approx.map((b, i) => i);
+  const rows = groups(all, 'y', (i) => approx[i].y + approx[i].h / 2).map((g) => ({ g, c: best(g, 'y') }));
+  // blocks: consecutive rows separated by the grid's regular pitch
+  const gaps = rows.slice(1).map((r, i) => r.c - rows[i].c);
+  // grid pitch = most frequent gap (a spurious row must not skew it)
+  const support = (g) => gaps.filter((h) => Math.abs(h - g) < 0.04 * g).length;
+  const pitch = gaps.reduce((a, g) => (support(g) > support(a) || (support(g) === support(a) && g < a) ? g : a), gaps[0] || 0);
+  const blocks = [];
+  rows.forEach((r, i) => {
+    if (i && Math.abs(gaps[i - 1] - pitch) < 0.04 * pitch) blocks[blocks.length - 1].push(r);
+    else blocks.push([r]);
+  });
+  const cx = new Float64Array(approx.length), cy = new Float64Array(approx.length);
+  // main block (most icons) first: its columns serve as fallback for the other blocks
+  const size = (blk) => blk.reduce((n, r) => n + r.g.length, 0);
+  blocks.sort((a, b) => size(b) - size(a));
+  const mainCols = [];
+  blocks.forEach((blk, bi) => {
+    const idx = blk.flatMap((r) => r.g);
+    for (const r of blk) for (const i of r.g) cy[i] = r.c;
+    for (const col of groups(idx, 'x', (i) => approx[i].x + approx[i].w / 2)) {
+      let c = best(col, 'x');
+      if (!bi) mainCols.push(c);
+      else if (!level(col, 'x')) {
+        // no reliable measurement in this column: align to the main grid if it's close
+        const near = mainCols.reduce((a, v) => (Math.abs(v - c) < Math.abs(a - c) ? v : a), Infinity);
+        if (Math.abs(near - c) < 0.15 * S) c = near;
+      }
+      for (const i of col) cx[i] = c;
+    }
+  });
+  return approx.map((b, i) => ({ x: cx[i] - S / 2, y: cy[i] - S / 2, w: S, h: S }));
+}
+
+// Off-grid: each icon keeps its own (square) measurement; a box without at least
+// 3 real straight edges is not an icon (texture, face, text…).
+// A "group" box (enclosing several smaller ones) is kept only if its 4 edges are sharp and
+// form a square: it's then a folder, and its content (mini-icons) is ignored.
+function looseBoxes(approx, meas, px, W, H) {
+  let cand = [];
+  approx.forEach((b, i) => {
+    const m = meas[i], nOk = ['L', 'R', 'T', 'B'].filter((k) => m[k].ok).length;
+    if (nOk < (b.group ? 4 : 3)) return;
+    const w = m.L.ok && m.R.ok ? m.R.p - m.L.p : NaN, h = m.T.ok && m.B.ok ? m.B.p - m.T.p : NaN;
+    const ref = (b.w + b.h) / 2, ms = [w, h].filter((v) => v > 0);
+    // the measurement must be square and stay close to the coarse box (wider tolerance
+    // when both dimensions are measured and agree)
+    if (ms.length === 2 && Math.abs(w - h) > 0.08 * Math.max(w, h)) return;
+    const tol = ms.length === 2 ? [0.75, 1.3] : [0.85, 1.15];
+    if (ms.some((v) => v < tol[0] * ref || v > tol[1] * ref)) return;
+    const S = ms.length ? median(ms) : ref;
+    const x = axisFit(m, 'L', 'R', b.x + b.w / 2, S).c - S / 2, y = axisFit(m, 'T', 'B', b.y + b.h / 2, S).c - S / 2;
+    if (x < -1 || y < -1 || x + S > W + 1 || y + S > H + 1) return; // overflows the image
+    cand.push({ x, y, w: S, h: S, q: nOk });
+  });
+  const folders = findFolders(cand, px, W, H);
+  // circle (avatar, button, badge…): not an icon
+  cand = cand.filter((c) => squircleCorners(px, W, H, c) >= 3).concat(folders);
+  // best measured (then largest) first; anything contained in an icon
+  // already kept (its logo, a folder's mini-icons, a duplicate) is ignored
+  cand.sort((a, b) => b.q - a.q || b.w - a.w);
+  const out = [];
+  for (const c of cand) {
+    if (out.some((k) => overlap(c, k) > 0.3 * c.w * c.h)) continue;
+    out.push({ x: c.x, y: c.y, w: c.w, h: c.h });
+  }
+  return out;
+}
+
+// "Full" corners: near each corner's diagonal, an icon squircle is still inside,
+// a circle already outside. Compare the color there with the color just inside
+// and just outside the neighboring edges. Returns the number of full corners (0 to 4).
+function squircleCorners(px, W, H, b) {
+  const S = b.w;
+  const col = (u, v) => {
+    const x = Math.min(W - 1, Math.max(0, Math.round(b.x + u * S))), y = Math.min(H - 1, Math.max(0, Math.round(b.y + v * S)));
+    const i = (y * W + x) * 4;
+    return [px[i], px[i + 1], px[i + 2]];
+  };
+  const d = (a, c) => Math.abs(a[0] - c[0]) + Math.abs(a[1] - c[1]) + Math.abs(a[2] - c[2]);
+  let full = 0;
+  for (const [sx, sy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+    const f = (t, s) => (s ? 1 - t : t); // coordinate measured from the corner
+    const p = col(f(0.12, sx), f(0.12, sy));
+    const inn = [col(f(0.06, sx), f(0.32, sy)), col(f(0.32, sx), f(0.06, sy))];
+    const out = [col(f(-0.04, sx), f(0.32, sy)), col(f(0.32, sx), f(-0.04, sy))];
+    const di = Math.min(...inn.map((c) => d(p, c))), dout = Math.min(...out.map((c) => d(p, c)));
+    // full: looks like the inner edge, or at least clearly different from the outside (busy icon)
+    if (di <= dout || dout > 60) full++;
+  }
+  return full;
+}
+
+// Folder seen off-grid: its mini-icons (≥ 3 neighbors, same size, tight pitch ≈ 1.2 × their size,
+// rows filled from the top left) are detected as icons. Measure the presumed folder
+// around them: if it has 4 sharp, square edges, it takes precedence (its content will be ignored).
+function findFolders(boxes, px, W, H) {
+  const cx = (b) => b.x + b.w / 2, cy = (b) => b.y + b.h / 2;
+  const linked = (a, b) => Math.abs(a.w - b.w) < 0.2 * a.w &&
+    Math.abs(cx(a) - cx(b)) < 1.5 * a.w && Math.abs(cy(a) - cy(b)) < 1.5 * a.w;
+  const seen = new Set(), out = [];
+  for (const b of boxes) {
+    if (seen.has(b)) continue;
+    const grp = [b];
+    seen.add(b);
+    for (let i = 0; i < grp.length; i++) for (const k of boxes) if (!seen.has(k) && linked(grp[i], k)) { seen.add(k); grp.push(k); }
+    if (grp.length < 3) continue;
+    const s = median(grp.map((k) => k.w));
+    const xs = grp.map(cx).sort((a, c) => a - c), ys = grp.map(cy).sort((a, c) => a - c);
+    const steps = xs.slice(1).map((v, i) => v - xs[i]).concat(ys.slice(1).map((v, i) => v - ys[i])).filter((d) => d > 0.6 * s);
+    const pitch = steps.length ? median(steps) : 1.2 * s;
+    const F = 4 * pitch; // 3 mini-icons + 2 margins ≈ 4 pitches
+    const margin = (F - 2 * pitch - s) / 2;
+    const guess = { x: xs[0] - s / 2 - margin, y: ys[0] - s / 2 - margin, w: F, h: F };
+    const m = measureEdges(px, W, H, guess, 0.12);
+    if (!['L', 'R', 'T', 'B'].every((k) => m[k].ok)) continue;
+    const w = m.R.p - m.L.p, h = m.B.p - m.T.p;
+    if (Math.abs(w - h) > 0.06 * w || Math.abs(w - F) > 0.15 * F) continue;
+    const S = (w + h) / 2;
+    out.push({ x: (m.L.p + m.R.p - S) / 2, y: (m.T.p + m.B.p - S) / 2, w: S, h: S, q: 5 });
+  }
+  return out;
+}
+
+// Red badge at the top right of the icon (measured at full resolution).
+function findBadge(px, W, H, icon) {
+  const s = Math.max(icon.w, icon.h);
+  const x0 = Math.max(0, Math.round(icon.x + 0.5 * s)), x1 = Math.min(W - 1, Math.round(icon.x + 1.4 * s));
+  const y0 = Math.max(0, Math.round(icon.y - 0.4 * s)), y1 = Math.min(H - 1, Math.round(icon.y + 0.5 * s));
+  if (x1 <= x0 || y1 <= y0) return null;
+  const redness = (x, y) => {
+    const i = (y * W + x) * 4, r = px[i];
+    return r > 150 ? r - Math.max(px[i + 1], px[i + 2]) : 0;
+  };
+  const isRed = (x, y) => {
+    const i = (y * W + x) * 4, r = px[i], g = px[i + 1], b = px[i + 2];
+    return r > 170 && r - g > 90 && r - b > 80;
+  };
+  // seed: red pixels outside the icon (above or to the right), so as not to confuse with red icon artwork
+  const bw = x1 - x0 + 1, seen = new Uint8Array(bw * (y1 - y0 + 1));
+  const stack = [];
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const outside = y < icon.y || x >= icon.x + icon.w;
+    if (outside && isRed(x, y)) { stack.push(x, y); seen[(y - y0) * bw + x - x0] = 1; }
+  }
+  if (stack.length / 2 < s * s * 0.004) return null;
+  let minX = W, minY = H, maxX = 0, maxY = 0;
+  while (stack.length) {
+    const y = stack.pop(), x = stack.pop();
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    for (let d = 0; d < 4; d++) {
+      const nx = x + (d === 0) - (d === 1), ny = y + (d === 2) - (d === 3);
+      if (nx < x0 || ny < y0 || nx > x1 || ny > y1) continue;
+      const q = (ny - y0) * bw + nx - x0;
+      if (seen[q]) continue;
+      seen[q] = 1;
+      if (isRed(nx, ny)) stack.push(nx, ny);
+    }
+  }
+  const w = maxX - minX + 1, h = maxY - minY + 1;
+  if (h < 0.12 * s || h > 0.6 * s || w > 1.2 * s || w < 0.8 * h) return null; // not a badge
+  if (maxX >= x1 || minY <= y0) return null; // touches the edge of the zone: it's something else (neighboring icon…)
+  // anti-aliased edge: extend by half a pixel per side if the neighboring row / column is still slightly red
+  const fringe = (xa, ya, xb, yb) => {
+    let m = 0;
+    for (let y = Math.max(0, ya); y <= Math.min(H - 1, yb); y++) for (let x = Math.max(0, xa); x <= Math.min(W - 1, xb); x++) m = Math.max(m, redness(x, y));
+    return m > 40 ? 0.5 : 0;
+  };
+  const l = fringe(minX - 1, minY, minX - 1, maxY), r = fringe(maxX + 1, minY, maxX + 1, maxY);
+  const t = fringe(minX, minY - 1, maxX, minY - 1), b = fringe(minX, maxY + 1, maxX, maxY + 1);
+  return { x: minX - l, y: minY - t, w: w + l + r, h: h + t + b };
+}
+
+/* ---------- Grid mode (home screen) ---------- */
+
+// Score of a square: share of points on each side (straight part, excluding rounded corners)
+// that land on an edge. Keep the weakest of the 4 sides.
+// need: minimum expected score; bail out (0) as soon as it becomes unreachable (fast scan).
+function sideScore(m, W, x, y, s, need = 0) {
+  const n = 10, maxMiss = n - Math.ceil(need * n - 1e-9);
+  const o = sideOffsets(s);
+  // the 4 sides are walked in parallel: an empty side triggers the earliest bail-out
+  const top = y * W + x, bottom = (y + s - 1) * W + x, right = top + s - 1;
+  let c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+  for (let k = 0; k < n; k++) {
+    const ok = o[k], ov = ok * W, lim = k + 1 - maxMiss;
+    if (m[top + ok]) c0++; else if (c0 < lim) return 0;
+    if (m[bottom + ok]) c1++; else if (c1 < lim) return 0;
+    if (m[top + ov]) c2++; else if (c2 < lim) return 0;
+    if (m[right + ov]) c3++; else if (c3 < lim) return 0;
+  }
+  return Math.min(c0, c1, c2, c3) / n;
+}
+
+// positions of the 10 points along a side (straight part), cached per size (called very often)
+function sideOffsets(s) {
+  let o = sideOffsets.cache[s];
+  if (!o) {
+    o = sideOffsets.cache[s] = new Int32Array(10);
+    for (let k = 0; k < 10; k++) o[k] = Math.round(s * (0.25 + 0.5 * k / 9));
+  }
+  return o;
+}
+sideOffsets.cache = {};
+
+// Interior near the edge is uniform (icon background) and different from the outside.
+function ringScore(px, W, H, x, y, s) {
+  const n = 10, ins = Math.max(2, Math.round(s * 0.1)), ou = Math.max(2, Math.round(s * 0.06));
+  const o = sideOffsets(s);
+  const inC = ringScore.inC, outC = ringScore.outC;
+  let ni = 0, no = 0;
+  // 4 points per position along the edge: 2 horizontal sides, 2 vertical (inside then outside)
+  for (let k = 0; k < n; k++) {
+    const ok = o[k];
+    for (let j = 0; j < 8; j++) {
+      const d = j < 4 ? ins : -ou, inside = j < 4;
+      const side = j & 3;
+      const qx = side < 2 ? x + ok : side === 2 ? x + d : x + s - 1 - d;
+      const qy = side < 2 ? (side === 0 ? y + d : y + s - 1 - d) : y + ok;
+      if (qx < 0 || qy < 0 || qx >= W || qy >= H) continue;
+      const i = (qy * W + qx) * 4;
+      if (inside) { inC[ni * 3] = px[i]; inC[ni * 3 + 1] = px[i + 1]; inC[ni * 3 + 2] = px[i + 2]; ni++; }
+      else { outC[no * 3] = px[i]; outC[no * 3 + 1] = px[i + 1]; outC[no * 3 + 2] = px[i + 2]; no++; }
+    }
+  }
+  if (!ni) return { uni: 0, diff: 0 };
+  // median color of the inner edge, channel by channel
+  const v = ringScore.ch.subarray(0, ni);
+  const med = [0, 0, 0];
+  for (let c = 0; c < 3; c++) {
+    for (let j = 0; j < ni; j++) v[j] = inC[j * 3 + c];
+    med[c] = kth(v, ni >> 1);
+  }
+  let u = 0, df = 0;
+  for (let j = 0; j < ni; j++) {
+    if (Math.abs(inC[j * 3] - med[0]) + Math.abs(inC[j * 3 + 1] - med[1]) + Math.abs(inC[j * 3 + 2] - med[2]) < 45) u++;
+  }
+  for (let j = 0; j < no; j++) {
+    if (Math.abs(outC[j * 3] - med[0]) + Math.abs(outC[j * 3 + 1] - med[1]) + Math.abs(outC[j * 3 + 2] - med[2]) > 45) df++;
+  }
+  return { uni: u / ni, diff: df / Math.max(1, no) };
+}
+ringScore.inC = new Uint8Array(120); ringScore.outC = new Uint8Array(120); ringScore.ch = new Uint8Array(40);
+
+// k-th smallest value (quickselect, modifies the array)
+function kth(a, k) {
+  let lo = 0, hi = a.length - 1;
+  while (lo < hi) {
+    const piv = a[(lo + hi) >> 1];
+    let i = lo, j = hi;
+    while (i <= j) {
+      while (a[i] < piv) i++;
+      while (a[j] > piv) j--;
+      if (i <= j) { const t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
+    }
+    if (k <= j) hi = j; else if (k >= i) lo = i; else return a[k];
+  }
+  return a[k];
+}
+
+// "Confident" squares: 4 sharp sides, uniform inner edge, contrast with the outside.
+// Ignore small squares contained in a larger one (e.g. a folder's mini-icons).
+function findSquares(px, grad, W, H) {
+  const N = W * H, minDim = Math.min(W, H);
+
+  const e = new Uint8Array(N);
+  for (let p = 0; p < N; p++) e[p] = grad[p] > 24 ? 1 : 0;
+  // thickened edges: tolerates a coarse scan step
+  const m = dilate(e, W, H, Math.max(2, Math.round(minDim / 200)));
+  const seeds = [];
+  for (let S = minDim * 0.06; S <= minDim * 0.45; S *= 1.04) {
+    const s = Math.round(S), step = Math.max(1, Math.round(s / 16));
+    for (let y = 0; y + s < H; y += step) for (let x = 0; x + s < W; x += step) {
+      const e = sideScore(m, W, x, y, s, 0.7);
+      if (e < 0.7) continue;
+      const { uni, diff } = ringScore(px, W, H, x, y, s);
+      const score = e * (0.5 + 0.5 * uni) * diff;
+      if (score >= 0.5) seeds.push({ x, y, w: s, h: s, score });
+    }
+  }
+  seeds.sort((a, b) => b.score - a.score);
+  const strong = [];
+  // remove duplicates only between squares of similar size: a small sharp square inside
+  // an icon (logo, folder mini-icon) must not hide the icon itself (sorted below)
+  for (const c of seeds) if (!strong.some((k) => iou(c, k) > 0.3 && Math.max(c.w, k.w) < 1.3 * Math.min(c.w, k.w))) strong.push(c);
+  return strong.filter((c) => !strong.some((k) => k.w > c.w * 1.3 && overlap(c, k) > 0.7 * c.w * c.h));
+}
+
+function detectGrid(px, grad, W, H, outer) {
+  const N = W * H;
+  const edgeMap = (T, R) => { const e = new Uint8Array(N); for (let p = 0; p < N; p++) e[p] = grad[p] > T ? 1 : 0; return dilate(e, W, H, R); };
+
+  // b) Dominant size
+  // for each candidate size, measure how well the squares form a grid (shared columns AND rows)
+  const cluster = (vals, tol) => {
+    vals = [...vals].sort((a, b) => a - b);
+    const out = [];
+    for (const v of vals) {
+      const last = out[out.length - 1];
+      if (last && v - last.v / last.n < tol) { last.v += v; last.n++; } else out.push({ v, n: 1 });
+    }
+    return out.map((c) => ({ c: c.v / c.n, n: c.n }));
+  };
+  const near = (cl, v) => cl.reduce((a, c) => (Math.abs(c.c - v) < Math.abs(a.c - v) ? c : a));
+  let best = [], bestQ = 0;
+  for (const c of outer) {
+    const g = outer.filter((k) => Math.abs(k.w - c.w) <= 0.1 * c.w);
+    if (g.length < 5) continue;
+    const tol = 0.4 * c.w;
+    const cx = cluster(g.map((b) => b.x + b.w / 2), tol), cy = cluster(g.map((b) => b.y + b.h / 2), tol);
+    const aligned = g.filter((b) => near(cx, b.x + b.w / 2).n >= 2 && near(cy, b.y + b.h / 2).n >= 2).length;
+    const q = (aligned * aligned / (cx.length * cy.length)) * c.w;
+    if (q > bestQ) { bestQ = q; best = g; }
+  }
+  if (best.length < 5) return null;
+  const S = best.map((b) => b.w).sort((a, b) => a - b)[best.length >> 1];
+
+  // c) Columns (at least 2 confident icons) and rows
+  const tol = 0.4 * S;
+  // two icons don't overlap: lines closer than 0.8 × the size are duplicates
+  // (keep the best supported)
+  const distinct = (cl) => {
+    const out = [];
+    for (const c of [...cl].sort((a, b) => b.n - a.n)) if (!out.some((o) => Math.abs(o.c - c.c) < 0.8 * S)) out.push(c);
+    return out.map((c) => c.c);
+  };
+  const colCl = cluster(best.map((b) => b.x + b.w / 2), tol);
+  let cols = distinct(colCl.filter((c) => c.n >= 2));
+  // a row may contain just one confident icon (e.g. the dock), if it's in a known column
+  const onCol = best.filter((b) => cols.some((c) => Math.abs(c - (b.x + b.w / 2)) < tol));
+  let rows = distinct(cluster(onCol.map((b) => b.y + b.h / 2), tol));
+  if (cols.length < 2 || rows.length < 2) return null;
+  // missing columns / rows: also try one grid pitch before/after and in the gaps
+  const extend = (lines, max) => {
+    if (lines.length < 2) return lines;
+    const pitch = Math.min(...lines.slice(1).map((v, i) => v - lines[i]));
+    const extra = [];
+    for (let v = lines[0] - pitch; v - S / 2 >= -0.05 * S; v -= pitch) extra.push(v);
+    for (let v = lines[lines.length - 1] + pitch; v + S / 2 <= max + 0.05 * S; v += pitch) extra.push(v);
+    for (let i = 1; i < lines.length; i++) for (let v = lines[i - 1] + pitch; v < lines[i] - 0.6 * pitch; v += pitch) extra.push(v);
+    return lines.concat(extra);
+  };
+  cols = extend(cols.sort((a, b) => a - b), W);
+  rows = extend(rows.sort((a, b) => a - b), H);
+
+  // d) Check each cell, with a slight realignment.
+  //    A doubtful cell (light icon on light background…) is kept as "to confirm": the fine
+  //    full-resolution measurement will decide (detectIcons).
+  const mLow = edgeMap(14, 1);
+  const found = [];
+  const r = Math.round(0.2 * S);
+  for (const cy of rows) for (const cx of cols) {
+    let bestCell = null;
+    for (const f of [0.94, 1, 1.06]) {
+      const s = Math.round(S * f);
+      for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+        const x = Math.round(cx - s / 2 + dx), y = Math.round(cy - s / 2 + dy);
+        if (x < 0 || y < 0 || x + s >= W || y + s >= H) continue;
+        const e = sideScore(mLow, W, x, y, s);
+        if (!bestCell || e > bestCell.e) bestCell = { x, y, w: s, h: s, e };
+      }
+    }
+    if (!bestCell) continue;
+    const { diff } = ringScore(px, W, H, bestCell.x, bestCell.y, bestCell.w);
+    if (bestCell.e < 0.85 || diff < 0.4) {
+      // re-centered on the grid (realignment found nothing reliable)
+      bestCell = { x: cx - S / 2, y: cy - S / 2, w: S, h: S, e: 0, weak: true };
+      if (bestCell.x < 0 || bestCell.y < 0 || bestCell.x + S > W || bestCell.y + S > H) continue;
+    }
+    found.push(bestCell);
+  }
+  // only one cell per slot
+  found.sort((a, b) => b.e - a.e);
+  const cells = [];
+  for (const c of found) if (!cells.some((k) => iou(c, k) > 0.2)) cells.push(c);
+  return cells.filter((c) => !c.weak).length >= 4 ? cells : null;
+}
+
+function looksLikeText(b, boxes) {
+  let close = 0;
+  for (const o of boxes) {
+    if (o === b) continue;
+    const hr = o.h / b.h;
+    if (hr < 0.4 || hr > 2.5) continue;
+    const vOverlap = Math.min(b.y + b.h, o.y + o.h) - Math.max(b.y, o.y);
+    if (vOverlap < 0.5 * Math.min(b.h, o.h)) continue;
+    const gap = Math.max(o.x - (b.x + b.w), b.x - (o.x + o.w));
+    if (gap < 0.45 * b.h) close++;
+  }
+  return close >= 1;
+}
+
+function components(mask, W, H) {
+  const seen = new Uint8Array(W * H);
+  const stack = new Int32Array(W * H);
+  const out = [];
+  for (let s = 0; s < W * H; s++) {
+    if (!mask[s] || seen[s]) continue;
+    let sp = 0, minX = W, minY = H, maxX = 0, maxY = 0;
+    stack[sp++] = s; seen[s] = 1;
+    while (sp) {
+      const p = stack[--sp];
+      const x = p % W, y = (p / W) | 0;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+        const q = ny * W + nx;
+        if (mask[q] && !seen[q]) { seen[q] = 1; stack[sp++] = q; }
+      }
+    }
+    out.push({ x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 });
+  }
+  return out;
+}
+
+function integral(src, W, H) {
+  const w1 = W + 1, S = new Int32Array(w1 * (H + 1));
+  for (let y = 0; y < H; y++) {
+    let row = 0;
+    for (let x = 0; x < W; x++) {
+      row += src[y * W + x];
+      S[(y + 1) * w1 + x + 1] = S[y * w1 + x + 1] + row;
+    }
+  }
+  return S;
+}
+
+function iou(a, b) {
+  const o = overlap(a, b);
+  return o / (a.w * a.h + b.w * b.h - o);
+}
+
+function dilate(src, W, H, R) {
+  // separable square dilation via sliding sums
+  const tmp = new Uint8Array(W * H), out = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    let sum = 0;
+    const row = y * W;
+    for (let x = -R; x < W + R; x++) {
+      const add = x + R, rem = x - R - 1;
+      if (add < W && add >= 0) sum += src[row + add];
+      if (rem >= 0 && rem < W) sum -= src[row + rem];
+      if (x >= 0 && x < W) tmp[row + x] = sum > 0 ? 1 : 0;
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    let sum = 0;
+    for (let y = -R; y < H + R; y++) {
+      const add = y + R, rem = y - R - 1;
+      if (add < H && add >= 0) sum += tmp[add * W + x];
+      if (rem >= 0 && rem < H) sum -= tmp[rem * W + x];
+      if (y >= 0 && y < H) out[y * W + x] = sum > 0 ? 1 : 0;
+    }
+  }
+  return out;
+}
+
+function overlap(a, b) {
+  const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+  const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+  return w > 0 && h > 0 ? w * h : 0;
+}
+
+/* =====================================================================
+ * Throwing icons from the spectator's iPhone to the performer's iPhone
+ *
+ * Spectator (App Clip, link guest): pastes the screenshot of their home screen, icons are
+ *   detected (same detection as Aura Fluid). Any icon can then be picked up with a finger
+ *   and thrown off the screen: its spot is filled with the rebuilt wallpaper, and the icon
+ *   flies over to the performer's iPhone through the AuraKit link.
+ * Performer (Aura Browser, link host): the icon comes in through the opposite border
+ *   (as if the two phones were side by side), with the same direction and speed, glides
+ *   and stops. The performer can move it around, or throw it back: it then flies back
+ *   into its spot on the spectator's phone.
+ * Roles: ?role=performer | ?role=spectator. Room code instead of App Clip pairing: ?room=CODE.
+ * Desktop test: two tabs, ?mock=host and ?mock=join.
+ * ===================================================================== */
+
+const params = AuraKit.params;
+let role = 'guest', link = null;
+const sentIcons = new Set();   // icons whose image the performer already has
+
+const THROW = {
+  MIN_SPEED: 650,    // finger speed at release (px/s) that counts as a throw
+  OUT_SPEED: 1500,   // minimum flight speed (px/s)
+  MAX_SPEED: 4500,
+  GLIDE: 0.42,       // performer: how far the icon glides in (fraction of the screen)
+  ICON_PX: 180,      // size of the image sent over the link (Bluetooth: keep it small)
+};
+const OPP = { left: 'right', right: 'left', top: 'bottom', bottom: 'top' };
+const viewW = () => window.innerWidth, viewH = () => window.innerHeight;
+if (params.has('debug')) stage.classList.add('debug');
+
+/* ---------- Role and link ---------- */
+
+const STATUS = {
+  idle: ['', 'Starting…'], starting: ['wait', 'Starting…'], waiting: ['wait', 'Waiting for the spectator'],
+  searching: ['wait', 'Looking for the performer…'], connected: ['ok', 'Connected'], error: ['err', 'Error'],
+  stopped: ['', 'Stopped'], unavailable: ['err', 'No Aura link'],
+};
+function showStatus() {
+  const [cls, txt] = STATUS[link.status] || ['', link.status];
+  const peer = [...link.peers.values()][0];
+  $('status').className = cls;
+  $('status').textContent = txt + (link.connected && peer ? ' · ' + peer : '') +
+    (link.error && cls === 'err' ? ' — ' + link.error : '');
+}
+
+(async () => {
+  const env = await AuraKit.ready();
+  const forced = (params.get('role') || '').toLowerCase();
+  role = /^(host|magicien|magician|performer|m)$/.test(forced) ? 'host'
+    : /^(guest|join|spectateur|spectator|s)$/.test(forced) ? 'guest'
+    : (env.available && !env.appClip ? 'host' : 'guest');
+  document.body.classList.add('role-' + role);
+  if (role === 'host') $('hint').textContent = 'Performer: paste your own home screen (or use a black screen). The icons thrown by the spectator land here.';
+  link = AuraKit.link({
+    role, room: params.get('room') || undefined, urlParams: false, rememberRoom: false,
+    name: role === 'host' ? 'Performer' : 'Spectator', debug: params.has('debug'),
+  });
+  link.on('status', showStatus);
+  link.on('connect', () => { if (role === 'host') AuraKit.haptics.success(); showStatus(); });
+  link.on('disconnect', showStatus);
+  link.onSync(() => sentIcons.clear());   // (re)connected: the performer may have reloaded
+  if (role === 'host') { link.onMessage('icon', onIcon); link.onMessage('throw', onThrow); }
+  else link.onMessage('return', onReturn);
+  showStatus();
+})();
+
+/* ---------- Shared geometry ---------- */
+
+// Where a centre leaving (x, y) along the unit vector (dx, dy) at s px/s crosses the screen border.
+// Sent as is to the other phone: border, position along it (0..1), direction, speed (screen widths/s),
+// and the delay before the crossing (ms).
+function exitInfo(x, y, dx, dy, s) {
+  const W = viewW(), H = viewH();
+  const tx = dx > 1e-6 ? (W - x) / (dx * s) : dx < -1e-6 ? -x / (dx * s) : Infinity;
+  const ty = dy > 1e-6 ? (H - y) / (dy * s) : dy < -1e-6 ? -y / (dy * s) : Infinity;
+  const t = Math.max(0, Math.min(tx, ty));
+  const ex = x + dx * s * t, ey = y + dy * s * t;
+  const edge = tx <= ty ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'bottom' : 'top');
+  const frac = edge === 'left' || edge === 'right' ? ey / H : ex / W;
+  return { edge, frac: Math.min(1, Math.max(0, frac)), dx, dy, speed: s / W, delay: Math.round(t * 1000) };
+}
+
+// The point of this screen's opposite border where an icon thrown from the other phone comes in.
+function entryPoint(t) {
+  const W = viewW(), H = viewH(), e = OPP[t.edge];
+  return { x: e === 'left' ? 0 : e === 'right' ? W : t.frac * W, y: e === 'top' ? 0 : e === 'bottom' ? H : t.frac * H };
+}
+
+// Finger velocity over the last 100 ms (0 if the finger stopped before lifting).
+function tracker() {
+  const pts = [];
+  return {
+    add(x, y) {
+      const t = performance.now();
+      pts.push({ t, x, y });
+      while (pts.length > 2 && t - pts[0].t > 100) pts.shift();
+    },
+    velocity() {
+      if (pts.length < 2) return { vx: 0, vy: 0 };
+      const a = pts[0], b = pts[pts.length - 1], dt = (b.t - a.t) / 1000;
+      if (dt <= 0 || performance.now() - b.t > 120) return { vx: 0, vy: 0 };
+      return { vx: (b.x - a.x) / dt, vy: (b.y - a.y) / dt };
+    },
+  };
+}
+
+/* =====================================================================
+ * SPECTATOR: pick up an icon, throw it off the screen
+ * ===================================================================== */
+
+let pieces = [];   // { id, cut, rect, cv, el, hole, state: home|drag|back|flying|away|returning, ox, oy, sc }
+let session = '';
+
+function runDetection() {
+  if (!currentImage) return;
+  stage.querySelectorAll('.hole, .piece').forEach((el) => el.remove());
+  pieces = [];
+  if (role === 'host') return;   // the performer's screenshot is just a backdrop
+  session = Date.now().toString(36);
+  const icons = detectIcons(currentImage);
+  const nw = currentImage.naturalWidth, nh = currentImage.naturalHeight;
+  const full = document.createElement('canvas');
+  full.width = nw; full.height = nh;
+  const fctx = full.getContext('2d', { willReadFrequently: true });
+  fctx.drawImage(currentImage, 0, 0);
+  const pix = fctx.getImageData(0, 0, nw, nh).data;
+  const pct = (el, b) => Object.assign(el.style, {
+    left: b.x * 100 + '%', top: b.y * 100 + '%', width: b.w * 100 + '%', height: b.h * 100 + '%',
+  });
+
+  icons.forEach((ic, i) => {
+    if (ic.badge) return;
+    const cut = ic.cut;
+    const badges = icons.filter((k) => k.badge && k.of === i);
+    // the icon (rounded corners) + its badge, cut from the original image
+    const parts = [{ c: cut, badge: false }, ...badges.map((k) => ({ c: k.cut, badge: true }))];
+    const x0 = Math.min(...parts.map((q) => q.c.x)), y0 = Math.min(...parts.map((q) => q.c.y));
+    const x1 = Math.max(...parts.map((q) => q.c.x + q.c.w)), y1 = Math.max(...parts.map((q) => q.c.y + q.c.h));
+    const b = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    const cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.round(b.w * nw)); cv.height = Math.max(1, Math.round(b.h * nh));
+    const ctx = cv.getContext('2d');
+    for (const q of parts) {
+      const x = (q.c.x - x0) * nw, y = (q.c.y - y0) * nh, w = q.c.w * nw, h = q.c.h * nh;
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, q.badge ? Math.min(w, h) / 2 : 0.225 * Math.min(w, h));
+      ctx.clip();
+      ctx.drawImage(currentImage, q.c.x * nw, q.c.y * nh, w, h, x, y, w, h);
+      ctx.restore();
+    }
+
+    // the spot it leaves: icon + badge, and on a home screen the label under it
+    const S = cut.w * nw, cx = (cut.x + cut.w / 2) * nw, m = 0.06 * S;
+    let hx0 = cut.x * nw - m, hy0 = cut.y * nh - m, hx1 = (cut.x + cut.w) * nw + m, hy1 = (cut.y + cut.h) * nh + m;
+    for (const k of badges) {
+      const bm = 0.15 * k.cut.h * nh;
+      hx0 = Math.min(hx0, k.cut.x * nw - bm); hy0 = Math.min(hy0, k.cut.y * nh - bm);
+      hx1 = Math.max(hx1, (k.cut.x + k.cut.w) * nw + bm); hy1 = Math.max(hy1, (k.cut.y + k.cut.h) * nh + bm);
+    }
+    if (icons.grid) {
+      hx0 = Math.min(hx0, cx - 0.72 * S); hx1 = Math.max(hx1, cx + 0.72 * S);
+      hy1 = Math.max(hy1, (cut.y + cut.h) * nh + 0.38 * S);
+    }
+    const patch = inpaint(pix, nw, nh, hx0, hy0, hx1, hy1);
+    patch.cv.className = 'hole';
+    pct(patch.cv, patch);
+    stage.appendChild(patch.cv);
+
+    cv.className = 'piece';
+    pct(cv, b);
+    stage.appendChild(cv);
+    pieces.push({ id: session + '-' + i, cut, rect: b, cv, el: cv, hole: patch.cv, state: 'home', ox: 0, oy: 0, sc: 1 });
+  });
+}
+
+// Rebuilds the wallpaper inside a rectangle from the colours all around it
+// (Coons patch: each side's colours, smoothed, blended towards the opposite side).
+function inpaint(px, W, H, x0, y0, x1, y1) {
+  x0 = Math.max(1, Math.floor(x0)); y0 = Math.max(1, Math.floor(y0));
+  x1 = Math.min(W - 1, Math.ceil(x1)); y1 = Math.min(H - 1, Math.ceil(y1));
+  const w = Math.max(1, x1 - x0), h = Math.max(1, y1 - y0);
+  const at = (x, y, c) => {
+    x = x < 0 ? 0 : x >= W ? W - 1 : x; y = y < 0 ? 0 : y >= H ? H - 1 : y;
+    return px[(y * W + x) * 4 + c];
+  };
+  const smooth = (a, n, r) => {
+    const out = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++) {
+      let s = 0, k = 0;
+      for (let j = Math.max(0, i - r); j <= Math.min(n - 1, i + r); j++) { s += a[j * 3 + c]; k++; }
+      out[i * 3 + c] = s / k;
+    }
+    return out;
+  };
+  // colours just outside the border, averaged over 3 px of depth
+  const band = (n, get) => {
+    const a = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++) a[i * 3 + c] = (get(i, 1, c) + get(i, 2, c) + get(i, 3, c)) / 3;
+    return smooth(a, n, Math.max(2, Math.round(n / 10)));
+  };
+  const T = band(w, (i, d, c) => at(x0 + i, y0 - d, c));
+  const B = band(w, (i, d, c) => at(x0 + i, y1 - 1 + d, c));
+  const L = band(h, (j, d, c) => at(x0 - d, y0 + j, c));
+  const R = band(h, (j, d, c) => at(x1 - 1 + d, y0 + j, c));
+  const corner = (a, i, b2, j, c) => (a[i * 3 + c] + b2[j * 3 + c]) / 2;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  const out = ctx.createImageData(w, h), o = out.data;
+  for (let c = 0; c < 3; c++) {
+    const TL = corner(T, 0, L, 0, c), TR = corner(T, w - 1, R, 0, c);
+    const BL = corner(B, 0, L, h - 1, c), BR = corner(B, w - 1, R, h - 1, c);
+    for (let j = 0; j < h; j++) {
+      const v = (j + 0.5) / h;
+      for (let i = 0; i < w; i++) {
+        const u = (i + 0.5) / w;
+        o[(j * w + i) * 4 + c] =
+          (1 - v) * T[i * 3 + c] + v * B[i * 3 + c] + (1 - u) * L[j * 3 + c] + u * R[j * 3 + c] -
+          ((1 - u) * (1 - v) * TL + u * (1 - v) * TR + (1 - u) * v * BL + u * v * BR);
+      }
+    }
+  }
+  for (let k = 3; k < o.length; k += 4) o[k] = 255;
+  ctx.putImageData(out, 0, 0);
+  return { cv, x: x0 / W, y: y0 / H, w: w / W, h: h / H };
+}
+
+// centre and size of a piece at rest, in screen pixels
+function homeCenter(p) {
+  const r = stage.getBoundingClientRect();
+  return {
+    x: r.left + (p.rect.x + p.rect.w / 2) * r.width, y: r.top + (p.rect.y + p.rect.h / 2) * r.height,
+    w: p.rect.w * r.width, h: p.rect.h * r.height,
+  };
+}
+function place(p) { p.el.style.transform = `translate(${p.ox}px, ${p.oy}px) scale(${p.sc})`; }
+function settle(p) {
+  p.state = 'home'; p.ox = 0; p.oy = 0; p.sc = 1; place(p);
+  p.el.classList.remove('on', 'lift');
+  p.hole.classList.remove('on');
+}
+
+// The icon's image, small enough for Bluetooth (the badge's transparent surroundings stay transparent).
+function iconData(p) {
+  if (!p.src) {
+    const k = Math.min(1, THROW.ICON_PX / Math.max(p.cv.width, p.cv.height));
+    let c = p.cv;
+    if (k < 1) {
+      c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(p.cv.width * k)); c.height = Math.max(1, Math.round(p.cv.height * k));
+      c.getContext('2d').drawImage(p.cv, 0, 0, c.width, c.height);
+    }
+    p.src = c.toDataURL('image/png');
+  }
+  const r = stage.getBoundingClientRect();
+  return { id: p.id, src: p.src, w: p.rect.w * r.width / viewW(), a: p.cv.width / p.cv.height };
+}
+// sent as soon as the icon is picked up, so that the throw itself is instant
+function preloadIcon(p) {
+  if (!link || !link.connected || sentIcons.has(p.id)) return;
+  sentIcons.add(p.id);
+  link.send('icon', iconData(p)).then((ok) => { if (!ok) sentIcons.delete(p.id); }, () => sentIcons.delete(p.id));
+}
+function sendThrow(p, t) {
+  if (!link || !link.connected) return;
+  const msg = Object.assign({ id: p.id }, t);
+  if (!sentIcons.has(p.id)) { Object.assign(msg, iconData(p)); sentIcons.add(p.id); }
+  link.send('throw', msg);
+}
+
+let drag = null;
+viewer.addEventListener('pointerdown', (e) => {
+  if (role === 'host' || drag || !pieces.length) return;
+  const r = stage.getBoundingClientRect();
+  const fx = (e.clientX - r.left) / r.width, fy = (e.clientY - r.top) / r.height;
+  // the icon under the finger (a little margin around it), the closest one if several
+  let p = null, best = Infinity;
+  for (const q of pieces) {
+    if (q.state !== 'home') continue;
+    const c = q.cut, mx = 0.15 * c.w, my = 0.15 * c.h;
+    if (fx < c.x - mx || fx > c.x + c.w + mx || fy < c.y - my || fy > c.y + c.h + my) continue;
+    const d = Math.hypot((fx - c.x - c.w / 2) * r.width, (fy - c.y - c.h / 2) * r.height);
+    if (d < best) { best = d; p = q; }
+  }
+  if (!p) return;
+  e.preventDefault();
+  try { viewer.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+  p.state = 'drag'; p.sc = 1.08;
+  p.el.classList.add('on', 'lift'); p.hole.classList.add('on');
+  place(p);
+  const c = homeCenter(p);
+  drag = { p, id: e.pointerId, gx: e.clientX - c.x, gy: e.clientY - c.y, tr: tracker() };
+  drag.tr.add(e.clientX, e.clientY);
+  preloadIcon(p);
+});
+viewer.addEventListener('pointermove', (e) => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const c = homeCenter(drag.p);
+  drag.p.ox = e.clientX - drag.gx - c.x; drag.p.oy = e.clientY - drag.gy - c.y;
+  drag.tr.add(e.clientX, e.clientY);
+  place(drag.p);
+});
+function endDrag(e) {
+  if (!drag || e.pointerId !== drag.id) return;
+  const { p, tr } = drag;
+  drag = null;
+  release(p, tr.velocity(), e.type === 'pointercancel');
+}
+viewer.addEventListener('pointerup', endDrag);
+viewer.addEventListener('pointercancel', endDrag);
+
+// Thrown (fast enough, or dropped off the screen) → flies away to the performer; otherwise back to its spot.
+function release(p, v, cancelled) {
+  const c = homeCenter(p), x = c.x + p.ox, y = c.y + p.oy;
+  const speed = Math.hypot(v.vx, v.vy);
+  const outside = x < 0 || y < 0 || x > viewW() || y > viewH();
+  if (!cancelled && (speed > THROW.MIN_SPEED || (outside && (p.ox || p.oy)))) {
+    let dx, dy;
+    if (speed > 200) { dx = v.vx / speed; dy = v.vy / speed; }
+    else { const m = Math.hypot(p.ox, p.oy); dx = p.ox / m; dy = p.oy / m; }
+    const s = Math.min(THROW.MAX_SPEED, Math.max(THROW.OUT_SPEED, speed));
+    sendThrow(p, exitInfo(x, y, dx, dy, s));
+    p.state = 'flying'; p.vx = dx * s; p.vy = dy * s;
+  } else {
+    p.state = 'back'; p.t0 = performance.now(); p.from = { ox: p.ox, oy: p.oy, sc: p.sc };
+  }
+  startLoop();
+}
+
+// The performer threw it back: it comes in through the opposite border and lands in its spot.
+function onReturn(t) {
+  const p = pieces.find((q) => q.id === t.id);
+  if (!p || p.state !== 'away') return;
+  const c = homeCenter(p), en = entryPoint(t);
+  const x0 = en.x - c.x, y0 = en.y - c.y;              // offset from its spot when it appears
+  const dist = Math.hypot(x0, y0), sp = Math.max(900, t.speed * viewW());
+  const lead = Math.min(0.5 * dist, 0.12 * sp);         // keeps its heading for a moment, then curves home
+  p.path = { x0, y0, x1: x0 + t.dx * lead, y1: y0 + t.dy * lead };
+  p.dur = Math.min(900, Math.max(380, 1600 * dist / sp));
+  p.start = performance.now() + Math.min(1500, t.delay || 0);
+  p.state = 'returning';
+  startLoop();
+}
+
+let raf = 0, lastT = 0;
+function startLoop() { if (!raf) { lastT = performance.now(); raf = requestAnimationFrame(loop); } }
+function loop(now) {
+  raf = 0;
+  const dt = Math.min(0.05, Math.max(0, (now - lastT) / 1000)); lastT = now;
+  let busy = false;
+  for (const p of pieces) {
+    if (p.state === 'flying') {
+      p.ox += p.vx * dt; p.oy += p.vy * dt;
+      const c = homeCenter(p), x = c.x + p.ox, y = c.y + p.oy, m = 0.6 * Math.max(c.w, c.h) * p.sc;
+      if (x < -m || y < -m || x > viewW() + m || y > viewH() + m) { p.state = 'away'; p.el.classList.remove('on', 'lift'); }
+      else { place(p); busy = true; }
+    } else if (p.state === 'back') {
+      const k = Math.min(1, (now - p.t0) / 220), e = 1 - (1 - k) ** 3;
+      p.ox = p.from.ox * (1 - e); p.oy = p.from.oy * (1 - e); p.sc = p.from.sc + (1 - p.from.sc) * e;
+      place(p);
+      if (k >= 1) settle(p); else busy = true;
+    } else if (p.state === 'returning') {
+      busy = true;
+      if (now < p.start) continue;
+      const k = Math.min(1, (now - p.start) / p.dur), e = 1 - (1 - k) ** 3, a = p.path;
+      p.ox = (1 - e) ** 2 * a.x0 + 2 * (1 - e) * e * a.x1;
+      p.oy = (1 - e) ** 2 * a.y0 + 2 * (1 - e) * e * a.y1;
+      p.sc = 1.08 - 0.08 * e;
+      p.el.classList.add('on', 'lift');
+      place(p);
+      if (k >= 1) { settle(p); AuraKit.haptics.light(); busy = false; }
+    }
+  }
+  if (busy || pieces.some((p) => p.state === 'flying' || p.state === 'back' || p.state === 'returning')) raf = requestAnimationFrame(loop);
+}
+
+/* =====================================================================
+ * PERFORMER: receive the icons, move them, throw them back
+ * ===================================================================== */
+
+const recv = new Map();      // id → { src, w (fraction of the screen width), a (aspect) }
+const waiting = new Map();   // throws whose image hasn't arrived yet
+let flies = [];              // icons on screen
+let hraf = 0, hlast = 0;
+
+function onIcon(d) {
+  recv.set(d.id, d);
+  const t = waiting.get(d.id);
+  if (t) { waiting.delete(d.id); spawn(t); }
+}
+function onThrow(t) {
+  if (t.src) recv.set(t.id, t);
+  if (!recv.has(t.id)) { waiting.set(t.id, t); return; }
+  // shows up when it would cross the border of the spectator's screen
+  setTimeout(() => spawn(t), Math.min(1500, t.delay || 0));
+}
+
+function spawn(t) {
+  const d = recv.get(t.id);
+  if (!d) return;
+  if (home.style.display !== 'none') showBlack();
+  flies.filter((f) => f.id === t.id).forEach(removeFly);
+  const W = viewW(), H = viewH(), w = d.w * W, h = w / d.a;
+  const el = new Image();
+  el.src = d.src; el.draggable = false; el.alt = '';
+  el.style.width = w + 'px'; el.style.height = h + 'px';
+  $('fly').appendChild(el);
+  const en = entryPoint(t), s = t.speed * W, e = OPP[t.edge];
+  const depth = e === 'left' || e === 'right' ? W : H;
+  // glides in and slows down: total distance ≈ GLIDE × the screen
+  const f = { id: t.id, el, w, h, x: en.x, y: en.y, vx: t.dx * s, vy: t.dy * s, k: s / (THROW.GLIDE * depth),
+    mode: 'glide', inX: false, inY: false, sc: 1 };
+  flies.push(f);
+  placeFly(f);
+  hookFly(f);
+  AuraKit.haptics.tap('medium');
+  startHostLoop();
+}
+
+function placeFly(f) { f.el.style.transform = `translate(${f.x - f.w / 2}px, ${f.y - f.h / 2}px) scale(${f.sc})`; }
+function removeFly(f) { f.el.remove(); flies = flies.filter((k) => k !== f); }
+
+function hookFly(f) {
+  let pid = null, gx = 0, gy = 0, tr = null;
+  f.el.addEventListener('pointerdown', (e) => {
+    if (f.mode === 'out' || pid !== null) return;
+    e.preventDefault(); e.stopPropagation();
+    try { f.el.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    pid = e.pointerId; f.mode = 'drag'; f.sc = 1.08;
+    gx = e.clientX - f.x; gy = e.clientY - f.y;
+    tr = tracker(); tr.add(e.clientX, e.clientY);
+    $('fly').appendChild(f.el);   // on top of the others
+    placeFly(f);
+  });
+  f.el.addEventListener('pointermove', (e) => {
+    if (e.pointerId !== pid) return;
+    f.x = e.clientX - gx; f.y = e.clientY - gy;
+    tr.add(e.clientX, e.clientY);
+    placeFly(f);
+  });
+  const up = (e) => {
+    if (e.pointerId !== pid) return;
+    pid = null; f.sc = 1;
+    const v = tr.velocity(), sp = Math.hypot(v.vx, v.vy);
+    const outside = f.x < 0 || f.y < 0 || f.x > viewW() || f.y > viewH();
+    if (e.type !== 'pointercancel' && (sp > THROW.MIN_SPEED || outside)) {
+      // thrown back to the spectator
+      let dx, dy;
+      if (sp > 200) { dx = v.vx / sp; dy = v.vy / sp; }
+      else { const ux = f.x - viewW() / 2, uy = f.y - viewH() / 2, m = Math.hypot(ux, uy) || 1; dx = ux / m; dy = uy / m; }
+      const s = Math.min(THROW.MAX_SPEED, Math.max(THROW.OUT_SPEED, sp));
+      f.mode = 'out'; f.vx = dx * s; f.vy = dy * s;
+      if (link && link.connected) link.send('return', Object.assign({ id: f.id }, exitInfo(f.x, f.y, dx, dy, s)));
+    } else {
+      f.mode = 'glide'; f.vx = v.vx; f.vy = v.vy; f.k = 6; f.inX = true; f.inY = true;
+    }
+    placeFly(f);
+    startHostLoop();
+  };
+  f.el.addEventListener('pointerup', up);
+  f.el.addEventListener('pointercancel', up);
+}
+
+function startHostLoop() { if (!hraf) { hlast = performance.now(); hraf = requestAnimationFrame(hostLoop); } }
+function hostLoop(now) {
+  hraf = 0;
+  const dt = Math.min(0.05, Math.max(0, (now - hlast) / 1000)); hlast = now;
+  const W = viewW(), H = viewH();
+  let busy = false;
+  for (const f of [...flies]) {
+    const hw = f.w / 2, hh = f.h / 2;
+    if (f.mode === 'out') {
+      f.x += f.vx * dt; f.y += f.vy * dt;
+      const m = 0.6 * Math.max(f.w, f.h);
+      if (f.x < -m || f.y < -m || f.x > W + m || f.y > H + m) removeFly(f);
+      else { placeFly(f); busy = true; }
+    } else if (f.mode === 'glide') {
+      f.x += f.vx * dt; f.y += f.vy * dt;
+      const damp = Math.exp(-f.k * dt);
+      f.vx *= damp; f.vy *= damp;
+      // borders bounce softly once the icon is fully in (on that axis)
+      if (f.x >= hw && f.x <= W - hw) f.inX = true;
+      if (f.y >= hh && f.y <= H - hh) f.inY = true;
+      if (f.inX && f.x < hw) { f.x = hw; f.vx = 0.35 * Math.abs(f.vx); }
+      if (f.inX && f.x > W - hw) { f.x = W - hw; f.vx = -0.35 * Math.abs(f.vx); }
+      if (f.inY && f.y < hh) { f.y = hh; f.vy = 0.35 * Math.abs(f.vy); }
+      if (f.inY && f.y > H - hh) { f.y = H - hh; f.vy = -0.35 * Math.abs(f.vy); }
+      if (Math.hypot(f.vx, f.vy) < 25) f.mode = 'snap';   // stopped: make sure it rests fully on screen
+      placeFly(f); busy = true;
+    } else if (f.mode === 'snap') {
+      const tx = Math.min(Math.max(f.x, hw), Math.max(hw, W - hw)), ty = Math.min(Math.max(f.y, hh), Math.max(hh, H - hh));
+      const a = 1 - Math.exp(-14 * dt);
+      f.x += (tx - f.x) * a; f.y += (ty - f.y) * a;
+      if (Math.abs(tx - f.x) < 0.5 && Math.abs(ty - f.y) < 0.5) { f.x = tx; f.y = ty; f.mode = 'rest'; }
+      else busy = true;
+      placeFly(f);
+    }
+  }
+  if (busy) hraf = requestAnimationFrame(hostLoop);
+}
+
+</script>
+</body>
+</html>
