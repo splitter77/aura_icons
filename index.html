@@ -939,6 +939,31 @@ function send(type, data) {
   return Promise.all(tasks).then((r) => r.some(Boolean));
 }
 
+/* ---------- Clock sync: both phones agree on when an icon crosses the border ---------- */
+// Ping/pong (NTP style): offset = other phone's clock − this one's, from the fastest round trip.
+// A throw then carries the absolute time of the crossing, so the transport delay
+// (Bluetooth or server) no longer adds up to the hand-off.
+const clock = { offset: null, rtt: Infinity, samples: [] };
+function ping() { if (connected()) send('tping', { a: Date.now() }); }
+function pingBurst() { for (let i = 0; i < 6; i++) setTimeout(ping, i * 120); }
+onMsg('tping', (d) => send('tpong', { a: d.a, b: Date.now() }));
+onMsg('tpong', (d) => {
+  const c = Date.now(), rtt = c - d.a;
+  if (!(rtt >= 0) || rtt > 5000) return;
+  clock.samples.push({ rtt, offset: d.b - (d.a + c) / 2, at: c });
+  clock.samples = clock.samples.filter((s) => c - s.at < 30000).slice(-12);
+  const best = clock.samples.reduce((m, s) => (s.rtt < m.rtt ? s : m));
+  clock.offset = best.offset; clock.rtt = best.rtt;
+  if (params.has('debug')) showStatus();
+});
+setInterval(ping, 3000);
+// When (in this phone's performance.now() time) the other phone's absolute time `at` happens.
+// Without a clock sync yet: `delay` ms after the message arrived, as before.
+function localTime(t) {
+  if (t.at && clock.offset !== null) return performance.now() + (t.at - clock.offset - Date.now());
+  return performance.now() + Math.min(1500, t.delay || 0);
+}
+
 /* ---------- Relay through the web server (duo) ---------- */
 
 const relay = { on: false, since: -1, peer: null, rank: -1, error: null, first: true };
@@ -982,7 +1007,7 @@ function onPeers(peers) {
   relay.first = false;
   if (other !== relay.peer) {
     relay.peer = other;
-    if (other) { sentIcons.clear(); announceIcons(); }   // a new iPhone: tell it where our icons are
+    if (other) { sentIcons.clear(); announceIcons(); pingBurst(); }   // a new iPhone: tell it where our icons are
     showStatus();
   }
   // Bluetooth: the iPhone that opened the page first hosts, the other joins
@@ -1004,6 +1029,7 @@ const STATUS = {
   searching: ['wait', 'Looking for the performer…'], connected: ['ok', 'Connected'], error: ['err', 'Error'],
   stopped: ['', 'Stopped'], unavailable: ['err', 'No Aura link'],
 };
+const syncInfo = () => (params.has('debug') && clock.offset !== null ? ` · latence ${Math.round(clock.rtt / 2)} ms` : '');
 function showStatus() {
   if (!link) return;
   const [cls, txt] = STATUS[link.status] || ['', link.status];
@@ -1013,12 +1039,12 @@ function showStatus() {
       : link.status === 'error' ? 'error' : 'searching (' + (link.wantedRole === 'host' ? 'host' : 'guest') + ')';
     const srv = relay.error ? 'error' : relay.peer ? 'other iPhone found' : 'waiting for the other iPhone';
     $('status').className = connected() ? 'ok' : relay.error && !link.connected ? 'err' : 'wait';
-    $('status').textContent = 'Bluetooth: ' + ble + ' · Server: ' + srv;
+    $('status').textContent = 'Bluetooth: ' + ble + ' · Server: ' + srv + syncInfo();
     return;
   }
   $('status').className = cls;
   $('status').textContent = txt + (link.connected && peer ? ' · ' + peer : '') +
-    (link.error && cls === 'err' ? ' — ' + link.error : '');
+    (link.error && cls === 'err' ? ' — ' + link.error : '') + syncInfo();
 }
 
 (async () => {
@@ -1035,10 +1061,10 @@ function showStatus() {
     autoStart: !duo,   // duo: the server picks the role first
   });
   link.on('status', showStatus);
-  link.on('connect', () => { AuraKit.haptics[role === 'host' && !duo ? 'success' : 'light'](); showStatus(); });
+  link.on('connect', () => { AuraKit.haptics[role === 'host' && !duo ? 'success' : 'light'](); showStatus(); pingBurst(); });
   link.on('disconnect', showStatus);
   // (re)connected: the other iPhone may have reloaded, tell it again where the icons are
-  link.onSync(() => { sentIcons.clear(); announceIcons(); });
+  link.onSync(() => { sentIcons.clear(); announceIcons(); pingBurst(); });
   link.onMessage('*', (type, data) => deliver(type, data));
   if (duo) relayLoop();
   showStatus();
@@ -1062,7 +1088,7 @@ function exitInfo(x, y, dx, dy, s) {
   const ex = x + dx * s * t, ey = y + dy * s * t;
   const edge = tx <= ty ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'bottom' : 'top');
   const frac = edge === 'left' || edge === 'right' ? ey / H : ex / W;
-  return { edge, frac: Math.min(1, Math.max(0, frac)), dx, dy, speed: s / W, delay: Math.round(t * 1000) };
+  return { edge, frac: Math.min(1, Math.max(0, frac)), dx, dy, speed: s / W, delay: Math.round(t * 1000), at: Date.now() + Math.round(t * 1000) };
 }
 
 // The point of this screen's opposite border where an icon thrown from the other phone comes in.
@@ -1353,7 +1379,7 @@ function onReturn(t) {
   const lead = Math.min(0.5 * dist, 0.12 * sp);         // keeps its heading for a moment, then curves home
   p.path = { x0, y0, x1: x0 + t.dx * lead, y1: y0 + t.dy * lead };
   p.dur = Math.min(900, Math.max(380, 1600 * dist / sp));
-  p.start = performance.now() + Math.min(1500, t.delay || 0);
+  p.start = Math.max(performance.now() - 400, localTime(t));   // late message: the flight starts already under way
   p.state = 'returning';
   startLoop();
 }
@@ -1415,26 +1441,40 @@ async function onIconsReady(d) {
   }
 }
 
+// The image is decoded as soon as it arrives, so that nothing is left to do when the icon shows up.
+function keepIcon(d) {
+  const img = new Image();
+  img.draggable = false; img.alt = '';
+  img.src = d.src;
+  if (img.decode) img.decode().catch(() => {});
+  recv.set(d.id, Object.assign({}, d, { img }));
+}
 function onIcon(d) {
-  recv.set(d.id, d);
+  keepIcon(d);
   const t = waiting.get(d.id);
-  if (t) { waiting.delete(d.id); spawn(t); }
+  if (t) { waiting.delete(d.id); schedule(t); }
 }
 function onThrow(t) {
-  if (t.src) recv.set(t.id, t);
+  if (t.src) keepIcon(t);
   if (!recv.has(t.id)) { waiting.set(t.id, t); return; }
-  // shows up when it would cross the border of the spectator's screen
-  setTimeout(() => spawn(t), Math.min(1500, t.delay || 0));
+  schedule(t);
+}
+// Shows up at the very moment it crosses the border of the spectator's screen. If the message
+// arrived late, it shows up right away, already as far along as it would be by now.
+const MAX_CATCH_UP = 0.5;   // s
+function schedule(t) {
+  const wait = localTime(t) - performance.now();
+  if (wait > 4) setTimeout(() => spawn(t, 0), Math.min(1500, wait));
+  else spawn(t, Math.min(MAX_CATCH_UP, -wait / 1000));
 }
 
-function spawn(t) {
+function spawn(t, late = 0) {
   const d = recv.get(t.id);
   if (!d) return;
   if (home.style.display !== 'none') showBlack();
   flies.filter((f) => f.id === t.id).forEach(removeFly);
   const W = viewW(), H = viewH(), w = d.w * W, h = w / d.a;
-  const el = new Image();
-  el.src = d.src; el.draggable = false; el.alt = '';
+  const el = d.img.cloneNode();   // already decoded: shows up on the very next frame
   el.style.width = w + 'px'; el.style.height = h + 'px';
   $('fly').appendChild(el);
   const en = entryPoint(t), s = t.speed * W, e = OPP[t.edge];
@@ -1442,6 +1482,10 @@ function spawn(t) {
   // glides in and slows down: total distance ≈ GLIDE × the screen
   const f = { id: t.id, el, w, h, x: en.x, y: en.y, vx: t.dx * s, vy: t.dy * s, k: s / (THROW.GLIDE * depth),
     mode: 'glide', inX: false, inY: false, sc: 1, ds: 1, dock: null };
+  if (late > 0) {   // where the glide would be by now
+    const g = (1 - Math.exp(-f.k * late)) / f.k, damp = Math.exp(-f.k * late);
+    f.x += f.vx * g; f.y += f.vy * g; f.vx *= damp; f.vy *= damp;
+  }
   flies.push(f);
   placeFly(f);
   hookFly(f);
