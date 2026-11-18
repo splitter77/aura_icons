@@ -1,81 +1,81 @@
 # Aura Icons
 
-Reprise d'`aura_fluid` : on colle une capture de l'écran d'accueil du spectateur, les icônes sont détectées (même détection qu'aura_fluid). Ensuite, au lieu de fondre, **le spectateur peut prendre n'importe quelle icône avec le doigt et la lancer hors de son écran : elle arrive sur l'iPhone du magicien**. Le lien entre les deux iPhones passe par [AuraKit](https://github.com/splitter77/aura_framework) (Bluetooth).
+A spin-off of `aura_fluid`: you paste a screenshot of the spectator's home screen and the icons are detected (same detection as aura_fluid). Then, instead of melting, **the spectator can grab any icon with a finger and throw it off their screen: it lands on the magician's iPhone**. The two iPhones are linked through [AuraKit](https://github.com/splitter77/aura_framework) (Bluetooth).
 
-## Rôles
+## Roles
 
-| Où la page s'ouvre | Rôle |
+| Where the page opens | Role |
 | --- | --- |
-| App Clip (scan du tag) | Spectateur : Paste de la capture, puis glisser‑lancer des icônes. |
-| Aura Browser | Magicien : Paste de son propre écran d'accueil (ou **Black screen**), les icônes lancées y arrivent. |
+| App Clip (tag scan) | Spectator: paste the screenshot, then drag and throw icons. |
+| Aura Browser | Magician: paste their own home screen (or **Black screen**); thrown icons land there. |
 
-Forcer un rôle : `?role=performer` ou `?role=spectator`. Code de salon au lieu de l'appairage par le tag : `?room=CODE`.
+Force a role: `?role=performer` or `?role=spectator`. Room code instead of pairing through the tag: `?room=CODE`.
 
-## Déroulé
+## Flow
 
-1. Spectateur : copier une capture d'écran, toucher **📋 Paste**. L'écran ressemble à son écran d'accueil.
-2. Il pose le doigt sur une icône : elle se soulève, son emplacement (et son nom dessous) est remplacé par le fond d'écran reconstitué.
-   - Lâchée doucement : elle revient à sa place.
-   - Lancée (ou lâchée hors de l'écran) : elle s'envole dans la direction du geste.
-3. Magicien : l'icône entre par le bord opposé (comme si les deux téléphones étaient côte à côte), dans la même direction, glisse puis s'arrête. Vibration à l'arrivée.
-4. Le magicien peut la déplacer, ou la relancer : elle revient alors se reposer à sa place sur l'écran du spectateur.
+1. Spectator: copy a screenshot, tap **📋 Paste**. The screen looks like their home screen.
+2. They put a finger on an icon: it lifts up, and its spot (and the name below it) is replaced by the reconstructed wallpaper.
+   - Released gently: it goes back to its spot.
+   - Thrown (or released off screen): it flies away in the direction of the gesture.
+3. Magician: the icon enters from the opposite edge (as if the two phones were side by side), in the same direction, glides, then stops. Vibration on arrival.
+4. The magician can move it, or throw it back: it then returns to rest in its spot on the spectator's screen.
 
-## Mode duo : deux iPhone empruntés (`?duo`)
+## Duo mode: two borrowed iPhones (`?duo`)
 
-Le téléphone du magicien n'intervient pas : deux spectateurs scannent **le même tag** (même adresse, avec `?duo`), et chacun colle la capture de son propre écran d'accueil. Chaque téléphone peut lancer ses icônes et reçoit celles de l'autre, dans n'importe quel sens.
+The magician's phone is not involved: two spectators scan **the same tag** (same address, with `?duo`), and each pastes a screenshot of their own home screen. Each phone can throw its icons and receives the other's, in any direction.
 
-- Une icône reçue glisse puis **se range dans la place libre la plus proche**, c'est‑à‑dire celle d'une icône que ce téléphone a lancée, à sa taille. Sans place libre, elle reste là où elle s'arrête.
-- Relancée vers l'autre téléphone, une icône reçue retourne à sa place d'origine. Si une icône occupe sa place à ce moment‑là, celle‑ci glisse pour lui laisser la place.
-- **Les messages passent par deux chemins à la fois** : Bluetooth (lien AuraKit) et le serveur (`relay.php`). Le premier arrivé l'emporte, le second est ignoré. Si le Bluetooth ne se connecte pas, le serveur suffit (avec internet, environ 0,1 à 0,5 s de plus).
-- **Rôles Bluetooth** : c'est le serveur qui les attribue. Le premier téléphone qui ouvre la page est l'hôte, le second rejoint. Si le premier s'en va, l'autre devient hôte.
-- Code de salon : `?room=CODE` (par défaut `duo`). Les deux téléphones doivent avoir le même.
-- La ligne d'état sous le bouton Paste indique l'état du Bluetooth et du serveur.
+- A received icon glides, then **settles into the nearest free spot**, i.e. the spot of an icon this phone has thrown, at that icon's size. If there is no free spot, it stays where it stops.
+- Thrown back to the other phone, a received icon returns to its original spot. If an icon occupies that spot at that moment, it slides away to make room.
+- **Messages travel over two paths at once**: Bluetooth (AuraKit link) and the server (`relay.php`). The first to arrive wins, the second is ignored. If Bluetooth does not connect, the server is enough (with internet, roughly 0.1 to 0.5 s slower).
+- **Bluetooth roles** are assigned by the server. The first phone to open the page is the host, the second joins. If the first one leaves, the other becomes host.
+- Room code: `?room=CODE` (default `duo`). Both phones must use the same one.
+- The status line under the Paste button shows the Bluetooth and server state.
 
-Exemple d'adresse pour le tag : `https://<serveur>/?duo&room=show1`
+Example tag address: `https://<server>/?duo&room=show1`
 
-## Verrouillage de l'App Clip (bouton de volume)
+## Locking the App Clip (volume button)
 
-Dans l'App Clip (spectateur, ou les deux téléphones en duo), un appui sur **un des boutons de volume** verrouille l'App Clip, avec une légère vibration : l'App Clip se ferme 0,5 s plus tard, sans écran noir (`LOCK_PRESS_QUIT_DELAY`). Si on la relance, elle n'affiche qu'un écran noir puis se ferme au bout d'environ 0,6 s. Le verrou est gardé dans le stockage de l'App Clip.
+In the App Clip (spectator, or both phones in duo mode), pressing **either volume button** locks the App Clip, with a light vibration: the App Clip quits 0.5 s later, without a black screen (`LOCK_PRESS_QUIT_DELAY`). If it is relaunched, it only shows a black screen, then quits after about 0.6 s. The lock is kept in the App Clip's storage.
 
-- Le verrou s'efface tout seul au bout de 12 h (`LOCK_HOURS` en haut d'`index.html`).
-- Déverrouiller tout de suite : scanner un lien App Clip (tag NFC ou QR code) avec `&unlock` à la fin, par exemple `https://appclip.apple.com/id?p=…&userId=…&unlock`. Ce paramètre ne sert qu'une fois : pour qu'il remarche, il faut d'abord avoir scanné un lien sans `&unlock` (le tag habituel du tour). Hors App Clip : `?unlock` dans l'adresse.
-- Les variations de volume dans les 1,5 s qui suivent le lancement ne comptent pas (détection qui démarre).
-- Nécessite une version d'Aura qui gère les boutons de volume (Aura 1.9+, branche `feature/aurakit-quit` de fsbrowser). La ligne d'état sous le bouton Paste indique `Volume: ready`, `locked`, ou `not supported by this Aura version`. Dans l'App Clip, iOS peut afficher l'indicateur de volume pendant l'appui.
-- Fermer l'App Clip nécessite que le Bluetooth soit activé et autorisé ; sinon l'écran reste noir.
-- Sur ordinateur (`?mock=join`) : touche **+** ou **-**.
+- The lock clears itself after 12 h (`LOCK_HOURS` at the top of `index.html`).
+- Unlock right away: scan an App Clip link (NFC tag or QR code) with `&unlock` at the end, e.g. `https://appclip.apple.com/id?p=…&userId=…&unlock`. This parameter only works once: for it to work again, a link without `&unlock` (the usual tag for the trick) must be scanned first. Outside the App Clip: `?unlock` in the address.
+- Volume changes within 1.5 s of launch are ignored (detection starting up).
+- Requires a version of Aura that supports the volume buttons (Aura 1.9+, `feature/aurakit-quit` branch of fsbrowser). The status line under the Paste button shows `Volume: ready`, `locked`, or `not supported by this Aura version`. In the App Clip, iOS may show the volume indicator during the press.
+- Quitting the App Clip requires Bluetooth to be on and authorized; otherwise the screen stays black.
+- On a computer (`?mock=join`): **+** or **-** key.
 
-## Transfert des icônes
+## Icon transfer
 
-Le Bluetooth est lent pour des images : elles passent donc par le serveur web.
+Bluetooth is slow for images, so they go through the web server.
 
-1. Juste après la détection, le téléphone du spectateur envoie toutes les icônes en une seule requête à `upload.php`, qui les range dans `data/<session>.json` (fichiers effacés au bout de 24 h).
-2. Une fois l'envoi terminé, un court message Bluetooth `icons-ready` donne au magicien l'adresse du fichier ; son téléphone télécharge toutes les icônes d'un coup. Le message est renvoyé à chaque reconnexion.
-3. Pendant le tour, le Bluetooth ne transporte que de petits messages (identifiant de l'icône, direction, vitesse : environ 150 octets).
+1. Right after detection, the spectator's phone sends all the icons in a single request to `upload.php`, which stores them in `data/<session>.json` (files deleted after 24 h).
+2. Once the upload is done, a short `icons-ready` Bluetooth message gives the magician the file's address; their phone downloads all the icons at once. The message is resent on every reconnection.
+3. During the trick, Bluetooth only carries small messages (icon ID, direction, speed: about 150 bytes).
 
-Si l'envoi au serveur échoue, l'ancien mode prend le relais : l'image part en Bluetooth dès que le spectateur touche l'icône.
+If the upload to the server fails, the old mode takes over: the image is sent over Bluetooth as soon as the spectator touches the icon.
 
-## Réglages
+## Settings
 
-Dans `index.html`, objet `THROW` : vitesse minimale d'un lancer, vitesse de vol, distance de glisse chez le magicien, taille de l'image envoyée.
+In `index.html`, `THROW` object: minimum throw speed, flight speed, glide distance on the magician's side, size of the sent image.
 
-## Fichiers
+## Files
 
 ```
-index.html     Page unique (détection d'aura_fluid, glisser-lancer, réception)
-upload.php     Reçoit les icônes du spectateur (serveur PHP)
-relay.php      Mode duo : relaie les messages entre les deux iPhone, attribue les rôles Bluetooth
-dev_server.py  Serveur de test local qui imite upload.php et relay.php (pas besoin de PHP)
-aurakit/       aurakit.js + aurakit-mock.js (copiés d'aura_twist)
+index.html     Single page (aura_fluid detection, drag-and-throw, receiving)
+upload.php     Receives the spectator's icons (PHP server)
+relay.php      Duo mode: relays messages between the two iPhones, assigns Bluetooth roles
+dev_server.py  Local test server that mimics upload.php and relay.php (no PHP needed)
+aurakit/       aurakit.js + aurakit-mock.js (copied from aura_twist)
 ```
 
-## Tester sur ordinateur
+## Testing on a computer
 
 ```bash
 python dev_server.py 5176
 ```
 
-Deux onglets du même navigateur : `http://localhost:5176/?mock=join` (spectateur) et `http://localhost:5176/?mock=host` (magicien). Mode duo : `http://localhost:5176/?mock=join&duo&room=test` dans les deux onglets. `?debug` montre les zones détectées.
+Two tabs in the same browser: `http://localhost:5176/?mock=join` (spectator) and `http://localhost:5176/?mock=host` (magician). Duo mode: `http://localhost:5176/?mock=join&duo&room=test` in both tabs. `?debug` shows the detected areas.
 
-## Mise en ligne
+## Deployment
 
-Servez le dossier en HTTPS avec PHP, sur un domaine présent dans les favoris Aura, et faites pointer le lien de l'App Clip vers `index.html`. PHP doit pouvoir créer le dossier `data/` à côté d'`upload.php`. Pour un autre emplacement du script : `?upload=URL` (même domaine).
+Serve the folder over HTTPS with PHP, on a domain listed in Aura's bookmarks, and point the App Clip link to `index.html`. PHP must be able to create the `data/` folder next to `upload.php`. For a different script location: `?upload=URL` (same domain).
