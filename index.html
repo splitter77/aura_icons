@@ -904,15 +904,17 @@ function overlap(a, b) {
  * ===================================================================== */
 
 const params = AuraKit.params;
-const duo = params.has('duo');
-const forced = (params.get('role') || '').toLowerCase();
+// duo / role / room: from the page address, or (App Clip) from the scanned link, which the page
+// only gets through Aura.launchParams(). Set at startup, once the launch parameters are read.
+let launch = {};
+const opt = (k) => (params.has(k) ? params.get(k) : launch && k in launch ? String(launch[k] == null ? '' : launch[k]) : null);
+let duo = false, forced = '', ROOM = 'duo';
 let role = 'guest', link = null;
 let sends = true;              // this phone has its own icons to throw (spectator, or duo)
 const sentIcons = new Set();   // icons whose image was sent over Bluetooth (fallback when the upload fails)
 // All the icons go to the web server right after detection; Bluetooth then only carries short messages.
 const UPLOAD_URL = params.get('upload') || 'upload.php';
 const RELAY_URL = params.get('relay') || 'relay.php';
-const ROOM = (params.get('room') || 'duo').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40) || 'duo';
 let upload = null;             // { session, url } once this phone's icons are on the server
 
 const THROW = {
@@ -1085,10 +1087,15 @@ function armLock() {
 // The scanned link's parameters stay readable when the App Clip is relaunched without a new scan,
 // so &unlock is used only once: it works again after a scan of a link without it (the trick's usual tag).
 const UNLOCK_SEEN_KEY = 'aura-icons.unlock-seen';
-async function unlockedByLink() {
+async function readLaunchParams() {
   try {
     const A = window.Aura;
     const p = A && typeof A.launchParams === 'function' ? await A.launchParams() : {};
+    return p && typeof p === 'object' ? p : {};
+  } catch (e) { return {}; }
+}
+async function unlockedByLink(p) {
+  try {
     if (!p || !('unlock' in p)) { localStorage.removeItem(UNLOCK_SEEN_KEY); return false; }
     if (localStorage.getItem(UNLOCK_SEEN_KEY)) return false;
     localStorage.setItem(UNLOCK_SEEN_KEY, '1');
@@ -1151,8 +1158,12 @@ function showStatus() {
 
 (async () => {
   const env = await AuraKit.ready();
-  await unlockedByLink();   // also run unlocked: it resets the once-only marker
+  launch = await readLaunchParams();
+  await unlockedByLink(launch);   // also run unlocked: it resets the once-only marker
   if (document.documentElement.classList.contains('locked')) { quitLocked(env); return; }
+  duo = opt('duo') !== null;
+  forced = (opt('role') || '').toLowerCase();
+  ROOM = (opt('room') || 'duo').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40) || 'duo';
   role = /^(host|magicien|magician|performer|m)$/.test(forced) ? 'host'
     : /^(guest|join|spectateur|spectator|s)$/.test(forced) ? 'guest'
     : duo ? 'guest' : (env.available && !env.appClip ? 'host' : 'guest');
@@ -1162,7 +1173,7 @@ function showStatus() {
   document.body.classList.add(duo ? 'role-duo' : 'role-' + role);
   if (role === 'host' && !duo) $('hint').textContent = 'Performer: paste your own home screen (or use a black screen). The icons thrown by the spectator land here.';
   link = AuraKit.link({
-    role, room: duo ? 'icons-' + ROOM : params.get('room') || undefined, urlParams: false, rememberRoom: false,
+    role, room: duo ? 'icons-' + ROOM : opt('room') || undefined, urlParams: false, rememberRoom: false,
     name: duo ? 'iPhone' : role === 'host' ? 'Performer' : 'Spectator', debug: params.has('debug'),
     autoStart: !duo,   // duo: the server picks the role first
   });

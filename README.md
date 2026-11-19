@@ -29,6 +29,7 @@ The magician's phone is not involved: two spectators scan **the same tag** (same
 - **Messages travel over two paths at once**: Bluetooth (AuraKit link) and the server (`relay.php`). The first to arrive wins, the second is ignored. If Bluetooth does not connect, the server is enough (with internet, roughly 0.1 to 0.5 s slower).
 - **Bluetooth roles** are assigned by the server. The first phone to open the page is the host, the second joins. If the first one leaves, the other becomes host.
 - Room code: `?room=CODE` (default `duo`). Both phones must use the same one.
+- `duo`, `room` and `role` are read from the page address or, in the App Clip, from the scanned link (`Aura.launchParams()`), e.g. `https://appclip.apple.com/id?p=…&duo&room=show1`.
 - The status line under the Paste button shows the Bluetooth and server state.
 
 Example tag address: `https://<server>/?duo&room=show1`
@@ -74,7 +75,7 @@ aurakit/       aurakit.js + aurakit-mock.js (copied from aura_twist)
 python dev_server.py 5176
 ```
 
-Two tabs in the same browser: `http://localhost:5176/?mock=join` (spectator) and `http://localhost:5176/?mock=host` (magician). Duo mode: `http://localhost:5176/?mock=join&duo&room=test` in both tabs. `?debug` shows the detected areas.
+Two tabs in the same browser: `http://localhost:5176/?mock=join` (spectator) and `http://localhost:5176/?mock=host` (magician). Duo mode: `http://localhost:5176/?mock=join&duo&room=test` in both tabs (as the App Clip gets it from the scanned link: `?mock=join&launch=duo%26room%3Dtest`). `?debug` shows the detected areas.
 
 ## Deployment
 

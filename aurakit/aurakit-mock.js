@@ -437,6 +437,9 @@
       },
     },
   };
+  // Scanned App Clip link parameters: ?launch=<url-encoded query>, e.g. ?mock=join&launch=duo%26room%3Dshow1
+  var launchQs = new URLSearchParams(location.search).get('launch');
+  if (launchQs !== null) Aura.launchParams = function () { return ok(Object.fromEntries(new URLSearchParams(launchQs))); };
   window.Aura = Aura;
   log('simulating ' + (appClip ? 'the AuraClip App Clip (guest)' : 'Aura Browser (host)'));
 })();
